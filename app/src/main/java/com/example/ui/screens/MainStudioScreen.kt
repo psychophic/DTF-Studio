@@ -6,7 +6,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -23,13 +22,25 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Print
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.ViewCarousel
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -42,13 +53,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.R
 import com.example.ui.components.StudioButton
+import com.example.ui.components.StudioScrollableTabs
 import com.example.ui.components.StudioSegmentedControl
 import com.example.ui.components.ZoomableCanvas
 import com.example.ui.tabs.AdjustTab
@@ -57,15 +66,19 @@ import com.example.ui.tabs.OutputTab
 import com.example.ui.tabs.PresetsTab
 import com.example.ui.tabs.RemoveTab
 import com.example.ui.theme.StudioAccent
+import com.example.ui.theme.StudioAccentLight
+import com.example.ui.theme.StudioAccentMedium
 import com.example.ui.theme.StudioBg
 import com.example.ui.theme.StudioBorder
 import com.example.ui.theme.StudioCard
+import com.example.ui.theme.StudioCardAlt
 import com.example.ui.theme.StudioMuted
 import com.example.ui.theme.StudioPanel
 import com.example.ui.theme.StudioText
 import com.example.viewmodel.StudioViewModel
 import kotlinx.coroutines.launch
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainStudioScreen(
     viewModel: StudioViewModel,
@@ -82,7 +95,6 @@ fun MainStudioScreen(
     val sourceDimensions by viewModel.sourceDimensions.collectAsState()
     val viewMode by viewModel.viewMode.collectAsState()
     val bgMode by viewModel.bgMode.collectAsState()
-    val zoomPercent by viewModel.zoomPercent.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
     val isBusy by viewModel.isBusy.collectAsState()
     val isExporting by viewModel.isExporting.collectAsState()
@@ -190,6 +202,133 @@ fun MainStudioScreen(
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "DTF Halftone",
+                                color = StudioAccent,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = " Studio",
+                                color = StudioText,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Text(
+                            text = "Developed by Shanewas",
+                            color = StudioMuted,
+                            fontSize = 10.sp
+                        )
+                    }
+                },
+                actions = {
+                    // Upload button in Top Bar
+                    StudioButton(
+                        text = "ছবি আপলোড",
+                        isPrimary = true,
+                        icon = Icons.Default.AddPhotoAlternate,
+                        onClick = {
+                            singlePicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        modifier = Modifier.padding(end = 4.dp)
+                    )
+
+                    IconButton(
+                        onClick = { viewModel.reset() },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "Reset settings",
+                            tint = StudioMuted
+                        )
+                    }
+
+                    IconButton(
+                        onClick = { viewModel.clear() },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteOutline,
+                            contentDescription = "Clear image",
+                            tint = StudioMuted
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = StudioPanel,
+                    titleContentColor = StudioText
+                ),
+                modifier = Modifier.border(0.dp, Color.Transparent, RoundedCornerShape(0.dp))
+            )
+        },
+        bottomBar = {
+            // Sticky Bottom Action Bar
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = StudioPanel,
+                shadowElevation = 6.dp,
+                border = androidx.compose.foundation.BorderStroke(1.dp, StudioBorder)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (isExporting) {
+                        LinearProgressIndicator(
+                            color = StudioAccent,
+                            trackColor = StudioCardAlt,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                        )
+                    }
+
+                    StudioButton(
+                        text = if (isExporting) "এক্সপোর্ট হচ্ছে…" else "Export Transparent PNG (এক্সপোর্ট)",
+                        isPrimary = true,
+                        enabled = !isExporting && sourceBitmap != null,
+                        onClick = {
+                            viewModel.exportTransparentPng { msg ->
+                                coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        StudioButton(
+                            text = "Print (প্রিন্ট…)",
+                            icon = Icons.Default.Print,
+                            onClick = { viewModel.showDialog("Print") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        StudioButton(
+                            text = "Batch (ব্যাচ…)",
+                            icon = Icons.Default.ViewCarousel,
+                            onClick = { viewModel.showDialog("Batch") },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        },
         modifier = modifier.fillMaxSize()
     ) { innerPadding ->
         BoxWithConstraints(
@@ -198,99 +337,161 @@ fun MainStudioScreen(
                 .padding(innerPadding)
                 .background(StudioBg)
         ) {
-            val isWide = maxWidth >= 760.dp
+            val isTabletOrLandscape = maxWidth >= 768.dp
 
-            if (isWide) {
-                // Wide Desktop / Tablet Side-by-Side layout
+            if (isTabletOrLandscape) {
+                // Tablet / Desktop side-by-side layout
                 Row(modifier = Modifier.fillMaxSize()) {
-                    StudioSidebar(
-                        viewModel = viewModel,
-                        params = params,
-                        currentTab = currentTab,
-                        activePreset = activePreset,
-                        presetDirty = presetDirty,
-                        presets = presets,
-                        isExporting = isExporting,
-                        sourceDimensions = sourceDimensions,
-                        onExport = {
-                            viewModel.exportTransparentPng { msg ->
-                                coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
-                            }
-                        },
+                    // Left Control Panel (380.dp)
+                    Column(
                         modifier = Modifier
                             .width(380.dp)
                             .fillMaxHeight()
-                    )
-
-                    StudioMainArea(
-                        viewModel = viewModel,
-                        sourceBitmap = sourceBitmap,
-                        resultBitmap = resultBitmap,
-                        sourceName = sourceName,
-                        viewMode = viewMode,
-                        bgMode = bgMode,
-                        zoomPercent = zoomPercent,
-                        statusMessage = statusMessage,
-                        isBusy = isBusy,
-                        isPickingColor = isPickingColor,
-                        fitTrigger = fitTrigger,
-                        onFit = { fitTrigger++ },
-                        onOpenImage = {
-                            singlePicker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            .background(StudioPanel)
+                            .padding(14.dp)
+                    ) {
+                        StudioControlsHeader(params, viewModel)
+                        StudioScrollableTabs(
+                            items = listOf("Remove", "Adjust", "Halftone", "Output", "Presets"),
+                            selected = currentTab,
+                            onSelect = { viewModel.setCurrentTab(it) }
+                        )
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .padding(top = 8.dp)
+                        ) {
+                            StudioTabContent(
+                                currentTab = currentTab,
+                                params = params,
+                                sourceDimensions = sourceDimensions,
+                                activePreset = activePreset,
+                                presetDirty = presetDirty,
+                                presets = presets,
+                                viewModel = viewModel
                             )
-                        },
+                        }
+                    }
+
+                    // Right Canvas Area
+                    Column(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
-                    )
+                            .padding(14.dp)
+                    ) {
+                        CanvasToolbar(
+                            sourceName = sourceName,
+                            viewMode = viewMode,
+                            bgMode = bgMode,
+                            viewModel = viewModel
+                        )
+
+                        val displayBitmap = if (viewMode == "Original") {
+                            viewModel.proxyBitmap ?: sourceBitmap
+                        } else {
+                            resultBitmap ?: viewModel.proxyBitmap ?: sourceBitmap
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .border(1.dp, StudioBorder, RoundedCornerShape(12.dp))
+                        ) {
+                            ZoomableCanvas(
+                                bitmap = displayBitmap,
+                                bgMode = bgMode,
+                                isPickingColor = isPickingColor,
+                                onPixelTapped = { x, y -> viewModel.onImageTapped(x, y) },
+                                onCancelPickColor = { viewModel.cancelPickColor() },
+                                onOpenImage = {
+                                    singlePicker.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    )
+                                },
+                                fitTrigger = fitTrigger
+                            )
+                        }
+
+                        StudioStatusBar(statusMessage = statusMessage, isBusy = isBusy)
+                    }
                 }
             } else {
-                // Mobile Portrait Responsive layout
-                Column(modifier = Modifier.fillMaxSize()) {
-                    // Canvas Preview Area on Top (40% height)
-                    StudioMainArea(
-                        viewModel = viewModel,
-                        sourceBitmap = sourceBitmap,
-                        resultBitmap = resultBitmap,
+                // Mobile Portrait Responsive Layout (Clean Stack)
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    // Preview Canvas Toolbar
+                    CanvasToolbar(
                         sourceName = sourceName,
                         viewMode = viewMode,
                         bgMode = bgMode,
-                        zoomPercent = zoomPercent,
-                        statusMessage = statusMessage,
-                        isBusy = isBusy,
-                        isPickingColor = isPickingColor,
-                        fitTrigger = fitTrigger,
-                        onFit = { fitTrigger++ },
-                        onOpenImage = {
-                            singlePicker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        },
+                        viewModel = viewModel
+                    )
+
+                    // Canvas Area (Fixed height 250.dp to leave ample space for controls without layout jumping)
+                    val displayBitmap = if (viewMode == "Original") {
+                        viewModel.proxyBitmap ?: sourceBitmap
+                    } else {
+                        resultBitmap ?: viewModel.proxyBitmap ?: sourceBitmap
+                    }
+
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .height(250.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.dp, StudioBorder, RoundedCornerShape(12.dp))
+                    ) {
+                        ZoomableCanvas(
+                            bitmap = displayBitmap,
+                            bgMode = bgMode,
+                            isPickingColor = isPickingColor,
+                            onPixelTapped = { x, y -> viewModel.onImageTapped(x, y) },
+                            onCancelPickColor = { viewModel.cancelPickColor() },
+                            onOpenImage = {
+                                singlePicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            fitTrigger = fitTrigger
+                        )
+                    }
+
+                    StudioStatusBar(statusMessage = statusMessage, isBusy = isBusy)
+
+                    // Mode Toggle: Remove Background vs Halftone
+                    StudioControlsHeader(params, viewModel)
+
+                    // Category Tabs
+                    StudioScrollableTabs(
+                        items = listOf("Remove", "Adjust", "Halftone", "Output", "Presets"),
+                        selected = currentTab,
+                        onSelect = { viewModel.setCurrentTab(it) }
+                    )
+
+                    // Tab Content (takes remaining vertical space)
+                    Box(
+                        modifier = Modifier
                             .weight(1f)
-                    )
-
-                    // Controls Sidebar / Bottom Sheet
-                    StudioSidebar(
-                        viewModel = viewModel,
-                        params = params,
-                        currentTab = currentTab,
-                        activePreset = activePreset,
-                        presetDirty = presetDirty,
-                        presets = presets,
-                        isExporting = isExporting,
-                        sourceDimensions = sourceDimensions,
-                        onExport = {
-                            viewModel.exportTransparentPng { msg ->
-                                coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
-                            }
-                        },
-                        modifier = Modifier
                             .fillMaxWidth()
-                            .weight(1.3f)
-                    )
+                            .padding(top = 4.dp)
+                    ) {
+                        StudioTabContent(
+                            currentTab = currentTab,
+                            params = params,
+                            sourceDimensions = sourceDimensions,
+                            activePreset = activePreset,
+                            presetDirty = presetDirty,
+                            presets = presets,
+                            viewModel = viewModel
+                        )
+                    }
                 }
             }
         }
@@ -298,290 +499,172 @@ fun MainStudioScreen(
 }
 
 @Composable
-private fun StudioSidebar(
-    viewModel: StudioViewModel,
+private fun StudioControlsHeader(
     params: com.example.model.DtfParams,
-    currentTab: String,
-    activePreset: String,
-    presetDirty: Boolean,
-    presets: Map<String, com.example.model.DtfParams>,
-    isExporting: Boolean,
-    sourceDimensions: Pair<Int, Int>,
-    onExport: () -> Unit,
-    modifier: Modifier = Modifier
+    viewModel: StudioViewModel
 ) {
-    Column(
-        modifier = modifier
-            .background(StudioPanel)
-            .padding(horizontal = 12.dp, vertical = 10.dp)
-    ) {
-        // App Header matching Python
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "DTF Halftone",
-                        color = StudioText,
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = " Studio",
-                        color = StudioMuted,
-                        fontSize = 17.sp
-                    )
-                }
-                Text(
-                    text = "Developed by Shanewas",
-                    color = StudioMuted,
-                    fontSize = 10.sp
-                )
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                StudioButton(
-                    text = "Reset",
-                    onClick = { viewModel.reset() }
-                )
-                StudioButton(
-                    text = "Clear",
-                    onClick = { viewModel.clear() }
-                )
-            }
-        }
-
-        // Mode switch: ["Remove Background", "Halftone"]
-        StudioSegmentedControl(
-            items = listOf("Remove Background", "Halftone"),
-            selected = params.mode,
-            onSelect = { viewModel.setMode(it) },
-            modifier = Modifier.padding(vertical = 8.dp)
-        )
-
-        // Tabs: ["Remove", "Adjust", "Halftone", "Output", "Presets"]
-        StudioSegmentedControl(
-            items = listOf("Remove", "Adjust", "Halftone", "Output", "Presets"),
-            selected = currentTab,
-            onSelect = { viewModel.setCurrentTab(it) },
-            modifier = Modifier.padding(bottom = 8.dp)
-        )
-
-        // Tab Content
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-        ) {
-            when (currentTab) {
-                "Remove" -> RemoveTab(
-                    params = params,
-                    onUpdateParams = { viewModel.updateParams(it) },
-                    onStartPickColor = { viewModel.startPickColor() }
-                )
-                "Adjust" -> AdjustTab(
-                    params = params,
-                    onUpdateParams = { viewModel.updateParams(it) }
-                )
-                "Halftone" -> HalftoneTab(
-                    params = params,
-                    onUpdateParams = { viewModel.updateParams(it) }
-                )
-                "Output" -> OutputTab(
-                    params = params,
-                    srcDimensions = sourceDimensions,
-                    onUpdateParams = { viewModel.updateParams(it) }
-                )
-                "Presets" -> PresetsTab(
-                    activePreset = activePreset,
-                    presetDirty = presetDirty,
-                    presets = presets,
-                    onApplyPreset = { viewModel.applyPreset(it) },
-                    onSavePreset = { viewModel.savePreset(it) },
-                    onDeletePreset = { viewModel.deletePreset(it) },
-                    onDeleteAllPresets = { viewModel.deleteAllPresets() },
-                    onResetToDefaults = { viewModel.reset() }
-                )
-            }
-        }
-
-        // Bottom Action Footer
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            if (isExporting) {
-                LinearProgressIndicator(
-                    color = StudioAccent,
-                    trackColor = StudioCard,
-                    modifier = Modifier.fillMaxWidth().height(4.dp)
-                )
-            }
-            StudioButton(
-                text = if (isExporting) "Exporting…" else "Export Transparent PNG",
-                isPrimary = true,
-                enabled = !isExporting,
-                onClick = onExport,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(40.dp)
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                StudioButton(
-                    text = "Print…",
-                    onClick = { viewModel.showDialog("Print") },
-                    modifier = Modifier.weight(1f)
-                )
-                StudioButton(
-                    text = "Batch…",
-                    onClick = { viewModel.showDialog("Batch") },
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-    }
+    StudioSegmentedControl(
+        items = listOf("Remove Background", "Halftone"),
+        selected = params.mode,
+        onSelect = { viewModel.setMode(it) },
+        modifier = Modifier.padding(vertical = 4.dp)
+    )
 }
 
 @Composable
-private fun StudioMainArea(
-    viewModel: StudioViewModel,
-    sourceBitmap: android.graphics.Bitmap?,
-    resultBitmap: android.graphics.Bitmap?,
+private fun CanvasToolbar(
     sourceName: String,
     viewMode: String,
     bgMode: String,
-    zoomPercent: Float,
-    statusMessage: String,
-    isBusy: Boolean,
-    isPickingColor: Boolean,
-    fitTrigger: Int,
-    onFit: () -> Unit,
-    onOpenImage: () -> Unit,
-    modifier: Modifier = Modifier
+    viewModel: StudioViewModel
 ) {
-    Column(
-        modifier = modifier
-            .background(StudioBg)
-            .padding(8.dp)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 6.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        // Top Toolbar matching Python
+        Text(
+            text = sourceName,
+            color = StudioMuted,
+            fontSize = 11.sp,
+            maxLines = 1,
+            modifier = Modifier.weight(1f).padding(end = 8.dp)
+        )
+
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 6.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // View Mode: Result / Original
             Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.weight(1f)
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(StudioCardAlt)
+                    .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
+                    .padding(2.dp)
             ) {
-                StudioButton(
-                    text = "Open Image",
-                    onClick = onOpenImage
-                )
-                Text(
-                    text = sourceName,
-                    color = StudioMuted,
-                    fontSize = 11.sp,
-                    maxLines = 1
-                )
+                listOf("Result", "Original").forEach { item ->
+                    val isSel = item == viewMode
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(if (isSel) StudioAccent else Color.Transparent)
+                            .clickable { viewModel.setViewMode(item) }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = item,
+                            color = if (isSel) Color.White else StudioMuted,
+                            fontSize = 10.sp,
+                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal
+                        )
+                    }
+                }
             }
 
+            // BG Mode: Checker / Black / White / Gray
             Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(StudioCardAlt)
+                    .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
+                    .padding(2.dp)
             ) {
-                // View: [Result, Original]
-                StudioSegmentedControl(
-                    items = listOf("Result", "Original"),
-                    selected = viewMode,
-                    onSelect = { viewModel.setViewMode(it) },
-                    modifier = Modifier.width(140.dp)
-                )
-
-                // Background: [Checker, Black, White, Gray]
-                StudioSegmentedControl(
-                    items = listOf("Checker", "Black", "White", "Gray"),
-                    selected = bgMode,
-                    onSelect = { viewModel.setBgMode(it) },
-                    modifier = Modifier.width(190.dp)
-                )
-
-                StudioButton(
-                    text = "Fit",
-                    onClick = onFit,
-                    modifier = Modifier.width(44.dp)
-                )
-
-                Text(
-                    text = "${(zoomPercent * 100).toInt()}%",
-                    color = StudioMuted,
-                    fontSize = 11.sp,
-                    modifier = Modifier.width(42.dp)
-                )
+                listOf("Checker", "Black", "White", "Gray").forEach { item ->
+                    val isSel = item == bgMode
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(if (isSel) StudioAccent else Color.Transparent)
+                            .clickable { viewModel.setBgMode(item) }
+                            .padding(horizontal = 6.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = item.take(3), // Che, Bla, Whi, Gra for compact display
+                            color = if (isSel) Color.White else StudioMuted,
+                            fontSize = 10.sp,
+                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal
+                        )
+                    }
+                }
             }
         }
+    }
+}
 
-        // Canvas Area
-        val displayBitmap = if (viewMode == "Original") {
-            viewModel.proxyBitmap ?: sourceBitmap
-        } else {
-            resultBitmap ?: viewModel.proxyBitmap ?: sourceBitmap
-        }
-
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
-        ) {
-            ZoomableCanvas(
-                bitmap = displayBitmap,
-                bgMode = bgMode,
-                isPickingColor = isPickingColor,
-                onPixelTapped = { x, y -> viewModel.onImageTapped(x, y) },
-                onZoomChanged = { z -> viewModel.setZoom(z) },
-                fitTrigger = fitTrigger
-            )
-        }
-
-        // Bottom Status Bar
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 4.dp, start = 4.dp, end = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = statusMessage,
-                color = StudioMuted,
-                fontSize = 11.sp,
-                maxLines = 1,
-                modifier = Modifier.weight(1f)
-            )
-            if (isBusy) {
+@Composable
+private fun StudioStatusBar(statusMessage: String, isBusy: Boolean) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp, horizontal = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = statusMessage,
+            color = StudioMuted,
+            fontSize = 11.sp,
+            maxLines = 1,
+            modifier = Modifier.weight(1f)
+        )
+        if (isBusy) {
+            Surface(
+                shape = RoundedCornerShape(4.dp),
+                color = StudioAccentLight
+            ) {
                 Text(
-                    text = "● Rendering…",
+                    text = "রেন্ডার হচ্ছে…",
                     color = StudioAccent,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun StudioTabContent(
+    currentTab: String,
+    params: com.example.model.DtfParams,
+    sourceDimensions: Pair<Int, Int>,
+    activePreset: String,
+    presetDirty: Boolean,
+    presets: Map<String, com.example.model.DtfParams>,
+    viewModel: StudioViewModel
+) {
+    when (currentTab) {
+        "Remove" -> RemoveTab(
+            params = params,
+            onUpdateParams = { viewModel.updateParams(it) },
+            onStartPickColor = { viewModel.startPickColor() }
+        )
+        "Adjust" -> AdjustTab(
+            params = params,
+            onUpdateParams = { viewModel.updateParams(it) }
+        )
+        "Halftone" -> HalftoneTab(
+            params = params,
+            onUpdateParams = { viewModel.updateParams(it) }
+        )
+        "Output" -> OutputTab(
+            params = params,
+            srcDimensions = sourceDimensions,
+            onUpdateParams = { viewModel.updateParams(it) }
+        )
+        "Presets" -> PresetsTab(
+            activePreset = activePreset,
+            presetDirty = presetDirty,
+            presets = presets,
+            onApplyPreset = { viewModel.applyPreset(it) },
+            onSavePreset = { viewModel.savePreset(it) },
+            onDeletePreset = { viewModel.deletePreset(it) },
+            onDeleteAllPresets = { viewModel.deleteAllPresets() },
+            onResetToDefaults = { viewModel.reset() }
+        )
     }
 }

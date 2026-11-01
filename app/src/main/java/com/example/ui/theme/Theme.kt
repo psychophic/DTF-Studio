@@ -1,36 +1,39 @@
 package com.example.ui.theme
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
 
-private val StudioColorScheme = darkColorScheme(
+private val ForestGreenColorScheme = lightColorScheme(
     primary = StudioAccent,
-    onPrimary = StudioText,
-    primaryContainer = StudioCard,
-    onPrimaryContainer = StudioText,
-    secondary = StudioAccentHover,
-    onSecondary = StudioText,
+    onPrimary = Color.White,
+    primaryContainer = StudioAccentLight,
+    onPrimaryContainer = StudioAccent,
+    secondary = StudioAccentMedium,
+    onSecondary = Color.White,
+    secondaryContainer = StudioAccentLight,
+    onSecondaryContainer = StudioAccent,
     background = StudioBg,
     onBackground = StudioText,
     surface = StudioPanel,
     onSurface = StudioText,
-    surfaceVariant = StudioCard,
+    surfaceVariant = StudioCardAlt,
     onSurfaceVariant = StudioMuted,
     outline = StudioBorder,
+    outlineVariant = StudioBorderStrong,
     error = StudioDanger,
-    onError = StudioText
+    onError = Color.White
 )
 
 @Composable
 fun MyApplicationTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = false, // Keep the authentic studio theme
+    darkTheme: Boolean = false,
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
     MaterialTheme(
-        colorScheme = StudioColorScheme,
+        colorScheme = ForestGreenColorScheme,
         typography = Typography,
         content = content
     )

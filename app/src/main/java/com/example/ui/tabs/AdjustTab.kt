@@ -24,53 +24,53 @@ fun AdjustTab(
         modifier = modifier
             .fillMaxWidth()
             .verticalScroll(rememberScrollState())
-            .padding(bottom = 16.dp)
+            .padding(horizontal = 4.dp, vertical = 6.dp)
     ) {
-        StudioSectionHeader("Tone")
+        StudioSectionHeader("Tone & Exposure")
         StudioSlider(
-            label = "Brightness",
+            label = "Brightness (উজ্জ্বলতা)",
             value = params.bright,
             onValueChange = { onUpdateParams { p -> p.copy(bright = it) } },
             valueRange = 50f..150f,
             valueText = "${params.bright.roundToInt()}%"
         )
         StudioSlider(
-            label = "Contrast",
+            label = "Contrast (কনট্রাস্ট)",
             value = params.contrast,
             onValueChange = { onUpdateParams { p -> p.copy(contrast = it) } },
             valueRange = 50f..200f,
             valueText = "${params.contrast.roundToInt()}%"
         )
         StudioSlider(
-            label = "Saturation",
+            label = "Saturation (স্যাচুরেশন)",
             value = params.sat,
             onValueChange = { onUpdateParams { p -> p.copy(sat = it) } },
             valueRange = 0f..200f,
             valueText = "${params.sat.roundToInt()}%"
         )
         StudioSlider(
-            label = "Gamma",
+            label = "Gamma (গামা কার্ভ)",
             value = params.gamma,
             onValueChange = { onUpdateParams { p -> p.copy(gamma = it) } },
             valueRange = 0.5f..2.0f,
             valueText = "%.2f".format(params.gamma)
         )
         StudioSlider(
-            label = "Sharpen",
+            label = "Sharpen (তীক্ষ্ণতা)",
             value = params.sharp,
             onValueChange = { onUpdateParams { p -> p.copy(sharp = it) } },
             valueRange = 0f..300f,
             valueText = "${params.sharp.roundToInt()}%"
         )
 
-        StudioSectionHeader("Colour")
+        StudioSectionHeader("Colour Modes")
         StudioSwitch(
-            text = "Convert to black & white",
+            text = "সাদা-কালো করুন (Black & White)",
             checked = params.gray,
             onCheckedChange = { onUpdateParams { p -> p.copy(gray = it) } }
         )
         StudioSwitch(
-            text = "Invert image",
+            text = "ইনভার্ট করুন (Invert image)",
             checked = params.invert,
             onCheckedChange = { onUpdateParams { p -> p.copy(invert = it) } }
         )

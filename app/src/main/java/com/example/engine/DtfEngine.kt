@@ -526,8 +526,8 @@ object DtfEngine {
             "Gray" -> canvas.drawColor(Color.rgb(128, 128, 128))
             else -> { // "Checker"
                 val s = max(12, max(w, h) / 70)
-                val paintDark = Paint().apply { color = Color.rgb(38, 38, 44) }
-                val paintLight = Paint().apply { color = Color.rgb(65, 65, 75) }
+                val paintDark = Paint().apply { color = Color.rgb(226, 232, 228) }
+                val paintLight = Paint().apply { color = Color.rgb(248, 250, 249) }
                 for (y in 0 until h step s) {
                     for (x in 0 until w step s) {
                         val isEven = ((x / s) + (y / s)) % 2 == 0

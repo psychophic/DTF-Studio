@@ -13,6 +13,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -30,8 +31,10 @@ import com.example.model.DtfParams
 import com.example.ui.components.StudioButton
 import com.example.ui.components.StudioSectionHeader
 import com.example.ui.theme.StudioAccent
+import com.example.ui.theme.StudioAccentLight
 import com.example.ui.theme.StudioBorder
 import com.example.ui.theme.StudioCard
+import com.example.ui.theme.StudioCardAlt
 import com.example.ui.theme.StudioMuted
 import com.example.ui.theme.StudioText
 
@@ -53,25 +56,42 @@ fun PresetsTab(
         modifier = modifier
             .fillMaxWidth()
             .verticalScroll(rememberScrollState())
-            .padding(bottom = 16.dp)
+            .padding(horizontal = 4.dp, vertical = 6.dp)
     ) {
-        Text(
-            text = "Active: $activePreset" + if (presetDirty) "  ·  modified" else "",
-            color = StudioText,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
-        )
+        // Active preset banner
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            shape = RoundedCornerShape(8.dp),
+            color = StudioAccentLight,
+            border = androidx.compose.foundation.BorderStroke(1.dp, StudioAccent.copy(alpha = 0.2f))
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "সক্রিয় প্রিসেট: ",
+                    color = StudioMuted,
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = activePreset + if (presetDirty) " (পরিবর্তিত)" else "",
+                    color = StudioAccent,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
 
-        StudioSectionHeader("Saved presets")
+        StudioSectionHeader("সংরক্ষিত প্রিসেট (Saved Presets)")
         val allPresets = listOf("Default") + presets.keys.filter { it != "Default" }
         allPresets.forEach { name ->
             val isActive = name == activePreset
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    .padding(vertical = 3.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 StudioButton(
@@ -85,40 +105,40 @@ fun PresetsTab(
                         text = "✕",
                         onClick = { onDeletePreset(name) },
                         isDanger = true,
-                        modifier = Modifier.size(34.dp)
+                        modifier = Modifier.size(40.dp)
                     )
                 }
             }
         }
 
-        StudioSectionHeader("Save current settings as")
+        StudioSectionHeader("বর্তমান সেটিংস সেভ করুন")
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 4.dp, vertical = 6.dp),
+                .padding(vertical = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             BasicTextField(
                 value = newPresetName,
                 onValueChange = { newPresetName = it },
-                textStyle = TextStyle(color = StudioText, fontSize = 12.sp),
-                cursorBrush = SolidColor(StudioText),
+                textStyle = TextStyle(color = StudioText, fontSize = 13.sp),
+                cursorBrush = SolidColor(StudioAccent),
                 decorationBox = { innerTextField ->
                     if (newPresetName.isEmpty()) {
-                        Text("Preset name", color = StudioMuted, fontSize = 12.sp)
+                        Text("প্রিসেটের নাম দিন…", color = StudioMuted, fontSize = 13.sp)
                     }
                     innerTextField()
                 },
                 modifier = Modifier
                     .weight(1f)
-                    .height(34.dp)
-                    .background(StudioCard, RoundedCornerShape(6.dp))
-                    .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
-                    .padding(horizontal = 10.dp, vertical = 8.dp)
+                    .height(42.dp)
+                    .background(StudioCard, RoundedCornerShape(8.dp))
+                    .border(1.dp, StudioBorder, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp, vertical = 11.dp)
             )
             StudioButton(
-                text = "Save",
+                text = "সেভ",
                 isPrimary = true,
                 onClick = {
                     if (newPresetName.isNotBlank()) {
@@ -128,24 +148,18 @@ fun PresetsTab(
                 }
             )
         }
-        Text(
-            text = "Same name = overwrite. Presets keep every setting (mode, removal, halftone, output).",
-            color = StudioMuted,
-            fontSize = 11.sp,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
-        )
 
-        StudioSectionHeader("Reset")
+        StudioSectionHeader("রিসেট অপশন")
         StudioButton(
-            text = "Reset to default settings",
+            text = "ডিফল্ট সেটিংসে রিসেট করুন",
             onClick = onResetToDefaults,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp)
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
         )
         StudioButton(
-            text = "Delete all saved presets",
+            text = "সব সংরক্ষিত প্রিসেট মুছুন",
             onClick = onDeleteAllPresets,
             isDanger = true,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp)
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
         )
     }
 }

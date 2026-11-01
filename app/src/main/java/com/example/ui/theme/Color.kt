@@ -2,16 +2,22 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-val StudioBg = Color(0xFF0E0E10)
-val StudioPanel = Color(0xFF141417)
-val StudioCard = Color(0xFF1C1C21)
-val StudioCardHover = Color(0xFF26262C)
-val StudioBorder = Color(0xFF2A2A31)
-val StudioText = Color(0xFFECECF1)
-val StudioMuted = Color(0xFF8A8A96)
-val StudioAccent = Color(0xFF5B6CF0)
-val StudioAccentHover = Color(0xFF6B7BFF)
-val StudioDanger = Color(0xFFE07A7A)
-val StudioDangerHover = Color(0xFF3A2326)
-val StudioWarning = Color(0xFFE0B050)
-val StudioSuccess = Color(0xFF7BD88F)
+// Minimal Clean White & Forest Green Palette
+val StudioBg = Color(0xFFF8FAF9)
+val StudioPanel = Color(0xFFFFFFFF)
+val StudioCard = Color(0xFFFFFFFF)
+val StudioCardAlt = Color(0xFFF1F5F2)
+val StudioCardHover = Color(0xFFE8F0EA)
+val StudioBorder = Color(0xFFE2E8E4)
+val StudioBorderStrong = Color(0xFFCBD5CE)
+val StudioText = Color(0xFF0F1E15)
+val StudioMuted = Color(0xFF5D7065)
+val StudioAccent = Color(0xFF1B4D3E)          // Deep Forest Green
+val StudioAccentMedium = Color(0xFF2D6A4F)    // Vibrant Forest Green
+val StudioAccentHover = Color(0xFF255B43)
+val StudioAccentLight = Color(0xFFE6F3EC)     // Soft Sage / Mint Green
+val StudioDanger = Color(0xFFDC2626)
+val StudioDangerHover = Color(0xFFB91C1C)
+val StudioDangerLight = Color(0xFFFEE2E2)
+val StudioWarning = Color(0xFFD97706)
+val StudioSuccess = Color(0xFF16A34A)
