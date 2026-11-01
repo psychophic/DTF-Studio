@@ -1,0 +1,6 @@
+{
+  "name": "DTF Halftone Studio",
+  "description": "T-shirt DTF background remover and halftone generator with live print preview, mockups, presets, and batch export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,2476 @@
+#!/usr/bin/env python3
+"""
+DTF Halftone Studio
+-------------------
+T-shirt DTF artwork এর জন্য ব্যাকগ্রাউন্ড রিমুভার + হাফটোন জেনারেটর।
+
+Install :  pip install customtkinter pillow numpy
+Run     :  python dtf_halftone_studio.py
+"""
+import io
+import os
+import sys
+import gc
+import base64
+import json
+import math
+import tempfile
+import subprocess
+import queue
+import threading
+
+import numpy as np
+from PIL import Image, ImageFilter, ImageOps, ImageEnhance
+
+Image.MAX_IMAGE_PIXELS = None
+
+# ============================================================================
+#  ENGINE
+# ============================================================================
+
+
+def smoothstep(x):
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def halftone(dens, rgb, cell, angle_deg, shape, gain, min_dot, flat_color):
+    """
+    dens : HxW float32 (0..1)  - ink density
+    rgb  : HxWx3 float32       - ink colour
+    Returns (alpha HxW float32, rgb HxWx3 float32 | None)
+    """
+    H, W = dens.shape
+    d8 = Image.fromarray((np.clip(dens, 0, 1) * 255 + 0.5).astype(np.uint8), "L")
+    blur = ImageFilter.GaussianBlur(max(0.6, cell * 0.5))
+    dsm = np.asarray(d8.filter(blur), dtype=np.float32) / 255.0
+
+    rsm = None
+    if flat_color:
+        weighted = np.clip(rgb * dens[..., None], 0, 1)
+        w8 = Image.fromarray((weighted * 255 + 0.5).astype(np.uint8), "RGB").filter(blur)
+        rsm = np.asarray(w8, dtype=np.float32) / 255.0
+        rsm = np.clip(rsm / np.maximum(dsm, 1e-3)[..., None], 0, 1)
+
+    th = math.radians(angle_deg)
+    c, s = math.cos(th), math.sin(th)
+    out_a = np.zeros((H, W), np.float32)
+    out_c = np.zeros((H, W, 3), np.float32) if flat_color else None
+    xs = np.arange(W, dtype=np.float32)[None, :]
+    CH = 256
+
+    for y0 in range(0, H, CH):
+        y1 = min(H, y0 + CH)
+        ys = np.arange(y0, y1, dtype=np.float32)[:, None]
+        u = (xs * c + ys * s) / cell
+        v = (-xs * s + ys * c) / cell
+        iu, iv = np.floor(u), np.floor(v)
+        du, dv = u - iu - 0.5, v - iv - 0.5
+        cx = ((iu + 0.5) * c - (iv + 0.5) * s) * cell
+        cy = ((iu + 0.5) * s + (iv + 0.5) * c) * cell
+        ix = np.clip(np.rint(cx), 0, W - 1).astype(np.int32)
+        iy = np.clip(np.rint(cy), 0, H - 1).astype(np.int32)
+
+        t = np.clip(dsm[iy, ix], 0, 1)
+        t = np.power(t, 1.0 / max(gain, 0.05))
+
+        if shape in ("Dot", "Circle"):
+            r = np.hypot(du, dv)
+            R = np.where(
+                t <= math.pi / 4,
+                np.sqrt(t / math.pi),
+                0.5 + (t - math.pi / 4) / (1 - math.pi / 4) * 0.2071,
+            )
+        elif shape == "Diamond":
+            r = np.abs(du) + np.abs(dv)
+            R = np.where(t <= 0.5, np.sqrt(t / 2.0), 0.5 + (t - 0.5))
+        elif shape == "Square":
+            r = np.maximum(np.abs(du), np.abs(dv))
+            R = 0.5 * np.sqrt(t)
+        else:  # Line
+            r = np.abs(dv)
+            R = 0.5 * t
+
+        cov = np.clip((R - r) * cell + 0.5, 0, 1)
+        if min_dot > 0:
+            cov = np.where(t < min_dot, 0.0, cov)
+        out_a[y0:y1] = cov
+        if flat_color:
+            out_c[y0:y1] = rsm[iy, ix]
+
+    return out_a, out_c
+
+
+def render(src, src_alpha, out_size, k, p, key, fit_long=None):
+    """
+    src       : PIL RGB (source or proxy)
+    src_alpha : PIL L or None
+    out_size  : (W, H) of the image to produce
+    k         : scale factor vs the final output (1.0 for export)
+    p         : params dict
+    key       : (r,g,b) for custom removal colour
+    """
+    img = src.resize(out_size, Image.LANCZOS) if src.size != out_size else src.copy()
+    src_a = None
+    if src_alpha is not None:
+        sa = src_alpha.resize(out_size, Image.BILINEAR) if src_alpha.size != out_size else src_alpha
+        src_a = np.asarray(sa, dtype=np.float32) / 255.0
+
+    # ---- pre adjustments --------------------------------------------------
+    if p["sharp"] > 0:
+        img = img.filter(ImageFilter.UnsharpMask(radius=max(0.6, 1.5 * k), percent=int(p["sharp"]), threshold=2))
+    if p["invert"]:
+        img = ImageOps.invert(img)
+    if p["gray"]:
+        img = ImageOps.grayscale(img).convert("RGB")
+    if abs(p["bright"] - 100) > 0.5:
+        img = ImageEnhance.Brightness(img).enhance(p["bright"] / 100.0)
+    if abs(p["contrast"] - 100) > 0.5:
+        img = ImageEnhance.Contrast(img).enhance(p["contrast"] / 100.0)
+    if abs(p["sat"] - 100) > 0.5:
+        img = ImageEnhance.Color(img).enhance(p["sat"] / 100.0)
+
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    if abs(p["gamma"] - 1.0) > 1e-3:
+        arr = np.power(arr, 1.0 / p["gamma"])
+
+    # ---- key colour -------------------------------------------------------
+    if p["target"] == "Black shirt":
+        keyc = np.zeros(3, np.float32)
+    elif p["target"] == "White shirt":
+        keyc = np.ones(3, np.float32)
+    else:
+        keyc = np.array(key, np.float32) / 255.0
+
+    d = np.abs(arr - keyc).max(axis=2)
+    tol = p["tol"] / 100.0
+    ramp = np.clip((d - tol) / max(1.0 - tol, 1e-3), 0, 1)
+    dens = np.power(ramp, 1.0 / max(p["density"] / 100.0, 0.05)).astype(np.float32)
+
+    if p["method"] == "Soft blend":
+        a = dens
+    else:
+        a = smoothstep((d - tol) / max(p["soft"] / 100.0, 0.005)).astype(np.float32)
+
+    if p["unmix"]:
+        col = np.clip(keyc + (arr - keyc) / np.maximum(d, 1e-3)[..., None], 0, 1)
+    else:
+        col = arr
+    is_ht = p["mode"] == "Halftone"
+    hdens = None
+    if is_ht:
+        # tonal density: brightness (black shirt) / darkness (white shirt)
+        wts = np.array([0.299, 0.587, 0.114], np.float32)
+        lum = arr @ wts
+        if p["target"] == "Black shirt":
+            base = lum
+        elif p["target"] == "White shirt":
+            base = 1.0 - lum
+        else:
+            kl = float(keyc @ wts)
+            base = np.abs(lum - kl) / max(kl, 1.0 - kl, 1e-3)
+        hr = np.clip((base - tol) / max(1.0 - tol, 1e-3), 0, 1)
+        hdens = np.power(hr, 1.0 / max(p["density"] / 100.0, 0.05)).astype(np.float32)
+        del lum, base, hr
+    del arr, d, ramp
+
+    if p["ink"] == "White":
+        col = np.ones_like(col)
+    elif p["ink"] == "Black":
+        col = np.zeros_like(col)
+
+    # ---- halftone ---------------------------------------------------------
+    if is_ht:
+        cell = max(2.0, p["dot"] * k)
+        a, hc = halftone(hdens, col, cell, p["angle"], p["shape"],
+                         p["gain"] / 100.0, p["mindot"] / 100.0, p["flat"])
+        if hc is not None:
+            col = hc
+
+    # ---- alpha clean-up ---------------------------------------------------
+    cut, snap = p["cut"] / 100.0, p["snap"] / 100.0
+    if cut > 0:
+        a = np.where(a < cut, 0.0, a)
+    if snap < 1:
+        a = np.where(a >= snap, 1.0, a)
+    if p["binary"]:
+        a = (a >= 0.5).astype(np.float32)
+    if src_a is not None:
+        a = a * src_a
+
+    a_img = Image.fromarray((a * 255 + 0.5).astype(np.uint8), "L")
+    n = int(round(abs(p["choke"]) * k))
+    if abs(p["choke"]) > 0 and n == 0:
+        n = 1
+    for _ in range(min(n, 40)):
+        a_img = a_img.filter(ImageFilter.MaxFilter(3) if p["choke"] > 0 else ImageFilter.MinFilter(3))
+
+    H, W = a.shape
+    rgba = np.empty((H, W, 4), np.uint8)
+    rgba[..., :3] = (col * 255 + 0.5).astype(np.uint8)
+    rgba[..., 3] = np.asarray(a_img)
+    out = Image.fromarray(rgba, "RGBA")
+
+    if p["mirror"]:
+        out = ImageOps.mirror(out)
+    if p["trim"]:
+        bb = out.getchannel("A").getbbox()
+        if bb:
+            out = out.crop(bb)
+    if fit_long:
+        w, h = out.size
+        if max(w, h) != fit_long:
+            if w >= h:
+                nsz = (int(fit_long), max(1, round(h * fit_long / w)))
+            else:
+                nsz = (max(1, round(w * fit_long / h)), int(fit_long))
+            out = out.resize(nsz, Image.LANCZOS)
+    return out
+
+
+def composite(rgba, bg):
+    a = np.asarray(rgba, dtype=np.float32)
+    h, w = a.shape[:2]
+    alpha = a[..., 3:4] / 255.0
+    if bg == "Checker":
+        s = max(8, max(w, h) // 90)
+        yy, xx = np.indices((h, w))
+        m = ((yy // s + xx // s) % 2).astype(np.float32)[..., None]
+        bgc = 100.0 + 40.0 * m
+    elif bg == "Black":
+        bgc = 0.0
+    elif bg == "White":
+        bgc = 255.0
+    else:
+        bgc = 128.0
+    out = a[..., :3] * alpha + bgc * (1 - alpha)
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")
+
+
+def make_underbase(rgba, choke):
+    a = rgba.getchannel("A").point(lambda v: 255 if v >= 10 else 0)
+    for _ in range(int(choke)):
+        a = a.filter(ImageFilter.MinFilter(3))
+    ub = Image.new("RGB", rgba.size, (255, 255, 255))
+    ub.putalpha(a)
+    return ub
+
+
+# ---------------------------------------------------------------------------
+#  PRINT / BATCH HELPERS
+# ---------------------------------------------------------------------------
+SHIRT_BODY_IN = {"Kids M": 14, "Youth M": 16, "S": 18, "M": 20, "L": 22, "XL": 24, "2XL": 26, "3XL": 28}
+PA4 = "A4 (8.27 × 11.69 in)"
+PA3 = "A3 (11.69 × 16.54 in)"
+PA3P = "A3+ / Super A3 (13 × 19 in)"
+PAPERS = {
+    "Exact design size": None,
+    PA4: (8.27, 11.69),
+    PA3: (11.69, 16.54),
+    PA3P: (13.0, 19.0),
+    "Legal (8.5 × 14 in)": (8.5, 14.0),
+    "Letter (8.5 × 11 in)": (8.5, 11.0),
+    "Roll 24 in": ("roll", 24.0),
+    "Roll 36 in": ("roll", 36.0),
+    "Roll 44 in": ("roll", 44.0),
+}
+PLACEMENTS = ["Center", "Left chest", "Right chest", "Left sleeve", "Right sleeve"]
+
+
+def _sz(name, w, h, view, place, top, paper, side=3.0):
+    return dict(name=name, w=w, h=h, view=view, place=place, top=top, side=side, paper=paper)
+
+
+# offsets: from the collar seam (sleeve: from the sleeve hem); side: centre line -> nearest edge (chest logos)
+DEFAULT_SIZES = [
+    _sz("Left Chest 4 × 3", 4, 3, "Front", "Left chest", 3.0, PA4),
+    _sz("Left Chest 3 × 3", 3, 3, "Front", "Left chest", 3.0, PA4),
+    _sz("Left Chest 4 × 4", 4, 4, "Front", "Left chest", 3.5, PA4),
+    _sz("Center Chest 8 × 8", 8, 8, "Front", "Center", 3.5, PA4),
+    _sz("Center Chest 8 × 10", 8, 10, "Front", "Center", 3.5, PA3),
+    _sz("Front Chest Wide 10 × 2", 10, 2, "Front", "Center", 3.0, PA3),
+    _sz("Full Front 10 × 12 (M, L)", 10, 12, "Front", "Center", 2.5, PA3),
+    _sz("Full Front 12 × 12", 12, 12, "Front", "Center", 2.0, PA3P),
+    _sz("Full Front 11 × 14 (XL, 2XL)", 11, 14, "Front", "Center", 2.5, PA3),
+    _sz("Back 10 × 12", 10, 12, "Back", "Center", 3.5, PA3),
+    _sz("Back 12 × 14", 12, 14, "Back", "Center", 4.0, PA3P),
+    _sz("Back 12 × 16", 12, 16, "Back", "Center", 3.5, PA3P),
+    _sz("Sleeve 2 × 2", 2, 2, "Front", "Left sleeve", 1.75, PA4),
+    _sz("Sleeve 3 × 3", 3, 3, "Front", "Left sleeve", 1.75, PA4),
+    _sz("Sleeve 3 × 4", 3, 4, "Front", "Left sleeve", 1.75, PA4),
+    _sz("Neck Label 2 × 2", 2, 2, "Back", "Center", 1.0, PA4),
+    _sz("Neck Label 2.5 × 2.5", 2.5, 2.5, "Back", "Center", 1.0, PA4),
+]
+APP_DIR = os.path.join(os.path.expanduser("~"), ".dtf_halftone_studio")
+SIZE_FILE = os.path.join(APP_DIR, "print_sizes.json")
+
+
+def fmt_num(x):
+    return (f"{x:.2f}".rstrip("0").rstrip(".")) or "0"
+
+
+def default_sizes():
+    return [dict(s) for s in DEFAULT_SIZES]
+
+
+def load_sizes():
+    unit, sizes = "in", []
+    try:
+        with open(SIZE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        unit = "cm" if data.get("unit") == "cm" else "in"
+        for s in data.get("sizes", []):
+            if isinstance(s, dict) and s.get("name") and float(s.get("w", 0)) > 0 and float(s.get("h", 0)) > 0:
+                sizes.append(dict(
+                    name=str(s["name"]), w=float(s["w"]), h=float(s["h"]),
+                    view=s.get("view") if s.get("view") in ("Front", "Back") else "Front",
+                    place=s.get("place") if s.get("place") in PLACEMENTS else "Center",
+                    top=float(s.get("top", 3.0)), side=float(s.get("side", 3.0)),
+                    paper=s.get("paper") if s.get("paper") in PAPERS else PA3))
+    except Exception:
+        pass
+    if not sizes:
+        sizes = default_sizes()
+    return unit, sizes
+
+
+def save_sizes(unit, sizes):
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(SIZE_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"unit": unit, "sizes": sizes}, fh, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def load_source(path):
+    im = ImageOps.exif_transpose(Image.open(path))
+    alpha = None
+    if im.mode in ("RGBA", "LA") or "transparency" in im.info:
+        im = im.convert("RGBA")
+        alpha = im.getchannel("A")
+        if alpha.getextrema() == (255, 255):
+            alpha = None
+    return im.convert("RGB"), alpha
+
+
+def fit_box(w, h, bw, bh):
+    s = min(bw / w, bh / h)
+    return max(1, round(w * s)), max(1, round(h * s))
+
+
+def render_for_box(src, src_alpha, box_px, p, key, mirror=False, k=1.0):
+    """Render the design so it fits inside box_px (keeps aspect ratio)."""
+    w, h = src.size
+    fw, fh = fit_box(w, h, box_px[0], box_px[1])
+    img = render(src, src_alpha, (fw, fh), k, dict(p, mirror=False), key)
+    if p.get("trim"):
+        iw, ih = img.size
+        nw, nh = fit_box(iw, ih, box_px[0], box_px[1])
+        if (nw, nh) != (iw, ih):
+            img = img.resize((nw, nh), Image.LANCZOS)
+    if mirror:
+        img = ImageOps.mirror(img)
+    return img
+
+
+def build_sheet(src, src_alpha, p, key, bw_in, bh_in, paper, dpi, mirror, margin_in=0.25):
+    """Return (sheet RGB image at `dpi`, (design_w_px, design_h_px))."""
+    box = (max(1, round(bw_in * dpi)), max(1, round(bh_in * dpi)))
+    design = render_for_box(src, src_alpha, box, p, key, mirror=mirror, k=1.0)
+    dw, dh = design.size
+    m = round(margin_in * dpi)
+    if paper is None:
+        pw, ph, x, y = dw, dh, 0, 0
+    elif paper[0] == "roll":                      # roll: fixed width, length = design + margins
+        pw, ph = round(paper[1] * dpi), dh + 2 * m
+        if dw > pw:
+            raise ValueError("The design is wider than the roll.")
+        x, y = (pw - dw) // 2, m
+    else:
+        pw, ph = round(paper[0] * dpi), round(paper[1] * dpi)
+        if (dw > pw - 2 * m or dh > ph - 2 * m) and (dw <= ph - 2 * m and dh <= pw - 2 * m):
+            pw, ph = ph, pw  # landscape sheet
+        if dw > pw or dh > ph:
+            raise ValueError("The design is larger than the selected paper.")
+        x, y = (pw - dw) // 2, m
+    sheet = Image.new("RGB", (pw, ph), (255, 255, 255))
+    sheet.paste(design.convert("RGB"), (x, y), design.getchannel("A"))
+    return sheet, (dw, dh)
+
+
+def save_sheet(sheet, path, dpi):
+    if path.lower().endswith(".png"):
+        sheet.save(path, "PNG", dpi=(dpi, dpi))
+    else:
+        sheet.save(path, "PDF", resolution=float(dpi), quality=100, subsampling=0)
+
+
+def list_printers():
+    names, default = [], None
+    try:
+        if sys.platform.startswith("win"):
+            import win32print
+            for pr in win32print.EnumPrinters(2 | 4, None, 1):
+                names.append(pr[2])
+            default = win32print.GetDefaultPrinter()
+        else:
+            out = subprocess.run(["lpstat", "-e"], capture_output=True, text=True, timeout=5).stdout
+            names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            d = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5).stdout
+            if ":" in d:
+                default = d.split(":", 1)[1].strip() or None
+    except Exception:
+        pass
+    return names, default
+
+
+def send_to_printer(sheet, dpi, printer, copies, title="DTF Halftone Studio"):
+    """Print the sheet at its true physical size. Returns a status message."""
+    use_default = printer in (None, "", "System default")
+    pdf = os.path.join(tempfile.gettempdir(), f"dtf_print_{os.getpid()}.pdf")
+
+    if sys.platform.startswith("win"):
+        try:
+            import win32print
+            import win32ui
+            import win32con
+            from PIL import ImageWin
+        except ImportError:
+            win32print = None
+        if win32print is not None:
+            name = win32print.GetDefaultPrinter() if use_default else printer
+            dc = win32ui.CreateDC()
+            dc.CreatePrinterDC(name)
+            try:
+                dc.StartDoc(title)
+                w_in, h_in = sheet.size[0] / dpi, sheet.size[1] / dpi
+                for _ in range(copies):
+                    dc.StartPage()
+                    lx = dc.GetDeviceCaps(win32con.LOGPIXELSX)
+                    ly = dc.GetDeviceCaps(win32con.LOGPIXELSY)
+                    ox = dc.GetDeviceCaps(win32con.PHYSICALOFFSETX)
+                    oy = dc.GetDeviceCaps(win32con.PHYSICALOFFSETY)
+                    box = (-ox, -oy, -ox + int(w_in * lx), -oy + int(h_in * ly))
+                    ImageWin.Dib(sheet).draw(dc.GetHandleOutput(), box)
+                    dc.EndPage()
+                dc.EndDoc()
+            finally:
+                dc.DeleteDC()
+            return f"Sent to printer: {name}  ({copies} cop{'y' if copies == 1 else 'ies'})"
+        # fallback without pywin32: let Windows print the PDF
+        save_sheet(sheet, pdf, dpi)
+        try:
+            os.startfile(pdf, "print")
+            return "Sent to the default printer via Windows. (Install pywin32 for direct printing.)"
+        except OSError:
+            os.startfile(pdf)
+            return "Print file opened in your PDF viewer - press Ctrl+P there. (Install pywin32 for direct printing.)"
+
+    save_sheet(sheet, pdf, dpi)
+    cmd = ["lp"]
+    if not use_default:
+        cmd += ["-d", printer]
+    cmd += ["-n", str(copies), "-o", "print-scaling=none", pdf]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        raise RuntimeError("The 'lp' command was not found. Use 'Save print file' instead.")
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "lp failed").strip())
+    return f"Sent to printer: {'default' if use_default else printer}"
+
+
+# ---- T-shirt mock-ups -------------------------------------------------------
+_SHIRT_STYLE = {  # fill, outline, collar/seams
+    "white": ((244, 244, 247, 255), (176, 176, 186, 255), (205, 205, 214, 255)),
+    "black": ((24, 24, 27, 255), (78, 78, 88, 255), (52, 52, 60, 255)),
+    "outline": ((0, 0, 0, 0), (214, 214, 226, 255), (160, 160, 172, 255)),
+}
+_SHIRT_CACHE = {}
+
+
+def _bezier(p0, c, p2, n=28):
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        pts.append(((1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * c[0] + t * t * p2[0],
+                    (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * c[1] + t * t * p2[1]))
+    return pts
+
+
+def make_shirt(kind, back):
+    """Procedurally drawn T-shirt (width 100 units = full width incl. sleeves, length 104 units)."""
+    from PIL import ImageDraw
+    fill, line, rib = _SHIRT_STYLE[kind]
+    SS = 2
+    W = 1040 * SS
+    u = W / 100.0
+    H = round(104 * u)
+    depth = 4.5 if back else 13.0
+    neck = _bezier((64, 1.5), (50, 2 * depth - 1.5), (36, 1.5))
+    left = [(36, 1.5), (15, 8), (1, 27), (14, 34), (14, 104)]
+    right = [(86, 104), (86, 34), (99, 27), (85, 8), (64, 1.5)]
+    sp = [(x * u, y * u) for x, y in left + right + neck[1:-1]]
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.polygon(sp, fill=fill)
+    d.line(sp + [sp[0]], fill=line, width=9 if kind == "outline" else 6, joint="curve")
+    d.line([(x * u, y * u) for x, y in neck], fill=rib, width=14, joint="curve")
+    d.line([(15 * u, 8 * u), (14 * u, 34 * u)], fill=rib, width=5)
+    d.line([(85 * u, 8 * u), (86 * u, 34 * u)], fill=rib, width=5)
+    return img.resize((1040, round(H / SS)), Image.LANCZOS)
+
+
+def _crop_shirt(im):
+    im = ImageOps.exif_transpose(im).convert("RGBA")
+    im.thumbnail((1600, 1600), Image.LANCZOS)
+    w, h = im.size
+    a = im.getchannel("A")
+    bb = None
+    if a.getextrema()[0] < 250:
+        bb = a.getbbox()
+    else:
+        arr = np.asarray(im.convert("RGB")).astype(np.int16)
+        corner = np.median(np.array([arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]]), axis=0)
+        mask = np.abs(arr - corner).max(axis=2) > 28
+        ys, xs = np.where(mask)
+        if len(xs):
+            bb = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    if bb is None or (bb[2] - bb[0]) < 0.3 * w or (bb[3] - bb[1]) < 0.3 * h:
+        bb = (0, 0, w, h)
+    return im.crop(bb)
+
+
+def _user_shirt(kind, back):
+    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shirts")
+    for n in ([kind + "_back"] if back else []) + [kind]:
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            fp = os.path.join(folder, n + ext)
+            if os.path.isfile(fp):
+                try:
+                    return _crop_shirt(Image.open(fp))
+                except Exception:
+                    pass
+    return None
+
+
+def get_shirt(kind, back):
+    key = (kind, bool(back))
+    if key not in _SHIRT_CACHE:
+        _SHIRT_CACHE[key] = _user_shirt(kind, back) or make_shirt(kind, back)
+    return _SHIRT_CACHE[key]
+
+
+# ============================================================================
+#  GUI
+# ============================================================================
+import tkinter as tk
+from PIL import ImageTk
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
+
+BG, PANEL, CARD = "#0e0e10", "#141417", "#1c1c21"
+TXT, MUTED, ACC, ACC_H = "#ececf1", "#8a8a96", "#5b6cf0", "#6b7bff"
+
+
+def maximize_window(win):
+    """Open a window at full size (so bottom buttons are always visible)."""
+    try:
+        win.state("zoomed")
+    except tk.TclError:
+        try:
+            win.attributes("-zoomed", True)
+        except tk.TclError:
+            win.geometry(f"{win.winfo_screenwidth()}x{win.winfo_screenheight()}+0+0")
+
+
+def load_logo(width):
+    """Logo from 'logo.png' next to this script (if present), otherwise the embedded one."""
+    try:
+        fp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+        if os.path.isfile(fp):
+            im = Image.open(fp)
+        else:
+            im = Image.open(io.BytesIO(base64.b64decode(LOGO_B64)))
+        im = im.convert("RGBA")
+        bb = im.getchannel("A").getbbox()
+        if bb:
+            im = im.crop(bb)
+        h = round(width * im.height / im.width)
+        return ctk.CTkImage(light_image=im, dark_image=im, size=(width, h))
+    except Exception:
+        return None
+
+
+
+class Viewer(tk.Canvas):
+    def __init__(self, master):
+        super().__init__(master, bg=BG, highlightthickness=0, bd=0)
+        self.img = None
+        self._tk = None
+        self.zoom, self.ox, self.oy = 1.0, 0.0, 0.0
+        self.on_click = None
+        self.on_zoom = None
+        self._drag = None
+        self._moved = False
+        self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._motion)
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<MouseWheel>", self._wheel)
+        self.bind("<Button-4>", self._wheel)
+        self.bind("<Button-5>", self._wheel)
+        self.bind("<Double-Button-1>", lambda e: self.fit())
+
+    def set_image(self, img, refit=False):
+        changed = self.img is None or self.img.size != img.size
+        self.img = img
+        if changed or refit:
+            self.fit()
+        else:
+            self.redraw()
+
+    def clear(self):
+        self.img = None
+        self._tk = None
+        self.delete("img")
+
+    def fit(self):
+        if self.img is None:
+            return
+        cw, ch = max(self.winfo_width(), 50), max(self.winfo_height(), 50)
+        iw, ih = self.img.size
+        self.zoom = min(cw / iw, ch / ih) * 0.96
+        self.ox, self.oy = (cw - iw * self.zoom) / 2, (ch - ih * self.zoom) / 2
+        self.redraw()
+
+    def redraw(self):
+        self.delete("img")
+        if self.img is None:
+            return
+        cw, ch = self.winfo_width(), self.winfo_height()
+        iw, ih = self.img.size
+        z = self.zoom
+        x0 = max(0, int(math.floor(-self.ox / z)))
+        y0 = max(0, int(math.floor(-self.oy / z)))
+        x1 = min(iw, int(math.ceil((cw - self.ox) / z)))
+        y1 = min(ih, int(math.ceil((ch - self.oy) / z)))
+        if x1 > x0 and y1 > y0:
+            crop = self.img.crop((x0, y0, x1, y1))
+            w, h = max(1, round((x1 - x0) * z)), max(1, round((y1 - y0) * z))
+            res = Image.NEAREST if z >= 3 else (Image.BILINEAR if z >= 1 else Image.LANCZOS)
+            self._tk = ImageTk.PhotoImage(crop.resize((w, h), res))
+            self.create_image(self.ox + x0 * z, self.oy + y0 * z, anchor="nw", image=self._tk, tags="img")
+        if self.on_zoom:
+            self.on_zoom(z)
+
+    def _wheel(self, e):
+        if self.img is None:
+            return
+        if getattr(e, "num", 0) == 4:
+            f = 1.15
+        elif getattr(e, "num", 0) == 5:
+            f = 1 / 1.15
+        else:
+            f = 1.15 if e.delta > 0 else 1 / 1.15
+        nz = min(max(self.zoom * f, 0.02), 20)
+        f = nz / self.zoom
+        self.ox = e.x - (e.x - self.ox) * f
+        self.oy = e.y - (e.y - self.oy) * f
+        self.zoom = nz
+        self.redraw()
+
+    def _press(self, e):
+        self._drag = (e.x, e.y, self.ox, self.oy)
+        self._moved = False
+
+    def _motion(self, e):
+        if not self._drag:
+            return
+        dx, dy = e.x - self._drag[0], e.y - self._drag[1]
+        if abs(dx) > 3 or abs(dy) > 3:
+            self._moved = True
+        if self._moved:
+            self.ox, self.oy = self._drag[2] + dx, self._drag[3] + dy
+            self.redraw()
+
+    def _release(self, e):
+        if self._drag and not self._moved and self.on_click and self.img is not None:
+            ix, iy = (e.x - self.ox) / self.zoom, (e.y - self.oy) / self.zoom
+            if 0 <= ix < self.img.size[0] and 0 <= iy < self.img.size[1]:
+                self.on_click(int(ix), int(iy))
+        self._drag = None
+
+
+class App(ctk.CTk):
+    SIZES = {"Original": None, "2K · 2048 px": 2048, "4K · 3840 px": 3840, "8K · 7680 px": 7680, "Custom": -1}
+
+    def __init__(self):
+        super().__init__(fg_color=BG)
+        ctk.set_appearance_mode("dark")
+        self.title("DTF Halftone Studio")
+        self.geometry("1420x880")
+        self.minsize(1100, 700)
+
+        self.src = self.src_alpha = self.proxy = self.proxy_alpha = None
+        self.src_size = (1, 1)
+        self.src_path = None
+        self.result = None
+        self.key_color = (0, 255, 0)
+        self.picking = False
+        self.vars = {}
+        self.q = queue.Queue()
+        self.busy = self.dirty = False
+        self._after = None
+        self._resetting = False
+        self._fs = False
+        self._refit = False
+        self.presets = self._load_presets()
+        self.active_preset = "Default"
+        self.preset_dirty = False
+
+        self._build()
+        self.bind("<Control-o>", lambda e: self.open_image())
+        self.bind("<Control-s>", lambda e: self.export())
+        self.bind("<Control-p>", lambda e: self.open_print())
+        self.bind("<F11>", self._toggle_fs)
+        self.bind("<Escape>", self._exit_fs)
+        self.after(250, self._maximize)
+        self.after(60, self._poll)
+
+    # ------------------------------------------------------------------ UI
+    def _build(self):
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        side = ctk.CTkFrame(self, width=400, fg_color=PANEL, corner_radius=0)
+        side.grid(row=0, column=0, sticky="nsew")
+        side.grid_propagate(False)
+        side.grid_rowconfigure(2, weight=1)
+        side.grid_columnconfigure(0, weight=1)
+
+        head = ctk.CTkFrame(side, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 6))
+        top = ctk.CTkFrame(head, fg_color="transparent")
+        top.pack(fill="x")
+        logo = load_logo(110)
+        if logo is not None:
+            ctk.CTkLabel(top, text="", image=logo).pack(side="left")
+        else:
+            ctk.CTkLabel(top, text="DTF Halftone", font=("Segoe UI", 18, "bold"), text_color=TXT).pack(side="left")
+            ctk.CTkLabel(top, text=" Studio", font=("Segoe UI", 18), text_color=MUTED).pack(side="left")
+        ctk.CTkButton(top, text="Clear", width=54, height=24, fg_color=CARD, hover_color="#26262c",
+                      text_color=MUTED, command=self.clear).pack(side="right", anchor="n")
+        ctk.CTkButton(top, text="Reset", width=54, height=24, fg_color=CARD, hover_color="#26262c",
+                      text_color=MUTED, command=self.reset).pack(side="right", anchor="n", padx=(0, 6))
+        ctk.CTkLabel(head, text="Developed by Shanewas", font=("Segoe UI", 10), text_color=MUTED,
+                     anchor="w").pack(fill="x")
+
+        tabs = ctk.CTkTabview(side, fg_color=PANEL, segmented_button_fg_color=CARD,
+                              segmented_button_selected_color=ACC, segmented_button_selected_hover_color=ACC_H,
+                              segmented_button_unselected_color=CARD, segmented_button_unselected_hover_color="#26262c",
+                              text_color=TXT)
+        tabs.grid(row=2, column=0, sticky="nsew", padx=10)
+        self.tabs = tabs
+        mf = ctk.CTkFrame(side, fg_color="transparent")
+        mf.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 8))
+        self.segment(mf, "mode", ["Remove Background", "Halftone"], "Remove Background")
+        self.vars["mode"][0].trace_add("write", self._mode_changed)
+        pages = {}
+        for name in ("Remove", "Adjust", "Halftone", "Output", "Presets"):
+            t = tabs.add(name)
+            sf = ctk.CTkScrollableFrame(t, fg_color="transparent")
+            sf.pack(fill="both", expand=True)
+            pages[name] = sf
+
+        self._tab_remove(pages["Remove"])
+        self._tab_adjust(pages["Adjust"])
+        self._tab_halftone(pages["Halftone"])
+        self._tab_output(pages["Output"])
+        self._tab_presets(pages["Presets"])
+
+        foot = ctk.CTkFrame(side, fg_color="transparent")
+        foot.grid(row=3, column=0, sticky="ew", padx=18, pady=14)
+        self.btn_export = ctk.CTkButton(foot, text="Export Transparent PNG", height=42, fg_color=ACC,
+                                        hover_color=ACC_H, font=("Segoe UI", 14, "bold"), command=self.export)
+        self.btn_export.pack(fill="x")
+        row2 = ctk.CTkFrame(foot, fg_color="transparent")
+        row2.pack(fill="x", pady=(8, 0))
+        row2.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(row2, text="Print…", height=32, fg_color=CARD, hover_color="#26262c", text_color=TXT,
+                      command=self.open_print).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(row2, text="Batch…", height=32, fg_color=CARD, hover_color="#26262c", text_color=TXT,
+                      command=self.open_batch).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.progress = ctk.CTkProgressBar(foot, height=4, progress_color=ACC, fg_color=CARD, mode="indeterminate")
+
+        # main
+        main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        main.grid(row=0, column=1, sticky="nsew")
+        main.grid_rowconfigure(1, weight=1)
+        main.grid_columnconfigure(0, weight=1)
+
+        bar = ctk.CTkFrame(main, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
+        # right-hand controls are packed FIRST and have a fixed size, so a long file name can never shrink them
+        self.zoom_lbl = ctk.CTkLabel(bar, text="", text_color=MUTED, width=50)
+        self.zoom_lbl.pack(side="right")
+        ctk.CTkButton(bar, text="Fit", width=44, height=30, fg_color=CARD, hover_color="#26262c", text_color=TXT,
+                      command=lambda: self.viewer.fit()).pack(side="right", padx=(8, 4))
+        self.bg_var = ctk.StringVar(value="Checker")
+        self._fixed_seg(bar, self.bg_var, ["Checker", "Black", "White", "Gray"], self._refresh_view, 290)
+        self.view_var = ctk.StringVar(value="Result")
+        self._fixed_seg(bar, self.view_var, ["Result", "Original"], self._refresh_view, 200, padx=(0, 14))
+        ctk.CTkButton(bar, text="Open Image", width=110, height=32, fg_color=CARD, hover_color="#26262c",
+                      text_color=TXT, command=self.open_image).pack(side="left")
+        self.lbl_file = ctk.CTkLabel(bar, text="No image loaded", text_color=MUTED, anchor="w")
+        self.lbl_file.pack(side="left", padx=14)
+
+        self.viewer = Viewer(main)
+        self.viewer.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        self.viewer.on_zoom = lambda z: self.zoom_lbl.configure(text=f"{z * 100:.0f}%")
+        self.viewer.on_click = self._on_click
+
+        self.status = ctk.CTkLabel(main, text="Open an image to begin  (Ctrl+O)", text_color=MUTED, anchor="w")
+        self.status.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
+
+    # ---- widget helpers
+    def _section(self, parent, text):
+        ctk.CTkLabel(parent, text=text.upper(), font=("Segoe UI", 10, "bold"), text_color=MUTED,
+                     anchor="w").pack(fill="x", pady=(16, 2), padx=4)
+
+    def _fixed_seg(self, parent, var, values, cmd, width, padx=0):
+        """Segmented button inside a fixed-size holder: width/height never change."""
+        holder = ctk.CTkFrame(parent, width=width, height=30, fg_color="transparent")
+        holder.pack_propagate(False)
+        holder.pack(side="right", padx=padx)
+        s = ctk.CTkSegmentedButton(holder, values=values, variable=var, command=lambda v: cmd(),
+                                   selected_color=ACC, selected_hover_color=ACC_H, unselected_color=CARD,
+                                   unselected_hover_color="#26262c", fg_color=CARD, text_color=TXT, height=28)
+        s.pack(fill="both", expand=True)
+        return s
+
+    def _seg(self, parent, var, values, cmd=None, pack="top", padx=0):
+        s = ctk.CTkSegmentedButton(parent, values=values, variable=var, command=(lambda v: cmd()) if cmd else None,
+                                   selected_color=ACC, selected_hover_color=ACC_H, unselected_color=CARD,
+                                   unselected_hover_color="#26262c", fg_color=CARD, text_color=TXT, height=28)
+        if pack == "top":
+            s.pack(fill="x", pady=(6, 0), padx=2)
+        else:
+            s.pack(side=pack, padx=padx)
+        return s
+
+    HT_KEYS = {"shape", "dot", "angle", "gain", "mindot", "ink", "flat"}
+
+    def _reg(self, key, var, default, live=True):
+        self.vars[key] = (var, default)
+        if key in self.HT_KEYS:
+            var.trace_add("write", self._auto_ht)
+        if key != "prevsz":
+            var.trace_add("write", self._mark_dirty)
+        if live:
+            var.trace_add("write", self.schedule)
+
+    def slider(self, parent, key, label, lo, hi, default, fmt="{:.0f}", steps=None, live=True):
+        var = ctk.DoubleVar(value=default)
+        self._reg(key, var, default, live)
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0), padx=4)
+        ctk.CTkLabel(row, text=label, text_color=TXT, anchor="w").pack(side="left")
+        val = ctk.CTkLabel(row, text=fmt.format(default), text_color=MUTED)
+        val.pack(side="right")
+        ctk.CTkSlider(parent, from_=lo, to=hi, variable=var, number_of_steps=steps, height=14,
+                      progress_color=ACC, button_color=ACC, button_hover_color=ACC_H,
+                      fg_color="#2a2a31").pack(fill="x", padx=4, pady=(2, 0))
+        var.trace_add("write", lambda *a: val.configure(text=fmt.format(var.get())))
+
+    def segment(self, parent, key, values, default, live=True):
+        var = ctk.StringVar(value=default)
+        self._reg(key, var, default, live)
+        self._seg(parent, var, values)
+        return var
+
+    def switch(self, parent, key, text, default, live=True):
+        var = ctk.BooleanVar(value=default)
+        self._reg(key, var, default, live)
+        ctk.CTkSwitch(parent, text=text, variable=var, progress_color=ACC, text_color=TXT,
+                      button_color="#d0d0d8").pack(anchor="w", pady=(10, 0), padx=4)
+
+    def menu(self, parent, key, values, default, label, live=True):
+        var = ctk.StringVar(value=default)
+        self._reg(key, var, default, live)
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0), padx=4)
+        ctk.CTkLabel(row, text=label, text_color=TXT).pack(side="left")
+        ctk.CTkOptionMenu(row, values=values, variable=var, fg_color=CARD, button_color=CARD,
+                          button_hover_color="#26262c", dropdown_fg_color=CARD, text_color=TXT,
+                          width=150, height=28).pack(side="right")
+
+    # ---- tabs
+    def _tab_remove(self, f):
+        self._section(f, "Print on")
+        self.segment(f, "target", ["Black shirt", "White shirt", "Custom"], "Black shirt")
+        ctk.CTkLabel(f, text="Black shirt → black removed  ·  White shirt → white removed",
+                     text_color=MUTED, font=("Segoe UI", 11), anchor="w").pack(fill="x", padx=4, pady=(4, 0))
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0), padx=4)
+        ctk.CTkButton(row, text="Pick colour from image", height=28, fg_color=CARD, hover_color="#26262c",
+                      text_color=TXT, command=self.start_pick).pack(side="left")
+        self.swatch = ctk.CTkFrame(row, width=28, height=28, fg_color=self._hex(self.key_color), corner_radius=6)
+        self.swatch.pack(side="right")
+
+        self._section(f, "Method")
+        self.segment(f, "method", ["Soft blend", "Solid cut"], "Soft blend")
+        self.slider(f, "tol", "Tolerance", 0, 60, 6, "{:.0f}%")
+        self.slider(f, "soft", "Edge softness (solid cut)", 0, 50, 12, "{:.0f}%")
+        self.slider(f, "density", "Ink density", 40, 220, 100, "{:.0f}%")
+        self.switch(f, "unmix", "Recover colours (un-blend edges)", True)
+
+        self._section(f, "DTF clean-up")
+        self.slider(f, "cut", "Drop faint pixels below", 0, 50, 3, "{:.0f}%")
+        self.slider(f, "snap", "Make opaque above", 50, 100, 100, "{:.0f}%")
+        self.slider(f, "choke", "Spread (+) / Choke (−)", -10, 10, 0, "{:+.0f} px", steps=20)
+        self.switch(f, "binary", "Binary alpha (no semi-transparency)", False)
+
+    def _tab_adjust(self, f):
+        self._section(f, "Tone")
+        self.slider(f, "bright", "Brightness", 50, 150, 100, "{:.0f}%")
+        self.slider(f, "contrast", "Contrast", 50, 200, 100, "{:.0f}%")
+        self.slider(f, "sat", "Saturation", 0, 200, 100, "{:.0f}%")
+        self.slider(f, "gamma", "Gamma", 0.5, 2.0, 1.0, "{:.2f}")
+        self.slider(f, "sharp", "Sharpen", 0, 300, 0, "{:.0f}%")
+        self._section(f, "Colour")
+        self.switch(f, "gray", "Convert to black & white", False)
+        self.switch(f, "invert", "Invert image", False)
+
+    def _tab_halftone(self, f):
+        ctk.CTkLabel(f, text="Pick a pattern to apply halftone. Zoom in on the preview to see the dots.",
+                     text_color=MUTED, font=("Segoe UI", 11), anchor="w", justify="left",
+                     wraplength=300).pack(fill="x", padx=4, pady=(8, 0))
+        self._section(f, "Pattern")
+        self.segment(f, "shape", ["Dot", "Diamond", "Square", "Line"], "Dot")
+        self._section(f, "Dots")
+        self.slider(f, "dot", "Dot spacing (output px)", 3, 40, 10, "{:.0f} px")
+        self.slider(f, "angle", "Screen angle", 0, 90, 45, "{:.0f}°")
+        self.slider(f, "gain", "Dot gain", 50, 200, 100, "{:.0f}%")
+        self.slider(f, "mindot", "Drop tiny dots below", 0, 20, 3, "{:.0f}%")
+        self._section(f, "Ink")
+        self.segment(f, "ink", ["Original", "White", "Black"], "Original")
+        self.switch(f, "flat", "Solid colour per dot", True)
+
+    def _tab_output(self, f):
+        self._section(f, "Resolution (long side)")
+        self.menu(f, "size", list(self.SIZES), "4K · 3840 px", "Size")
+        self.custom = ctk.StringVar(value="4096")
+        self._reg("custom", self.custom, "4096")
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0), padx=4)
+        ctk.CTkLabel(row, text="Custom px (long side)", text_color=TXT).pack(side="left")
+        self.custom_entry = ctk.CTkEntry(row, textvariable=self.custom, width=100, height=28, fg_color=CARD,
+                                         border_color="#2a2a31")
+        self.custom_entry.pack(side="right")
+        self.vars["size"][0].trace_add("write", lambda *a: self._update_custom_state())
+        self.menu(f, "dpi", ["150", "300", "600"], "300", "DPI (metadata)")
+        self.lbl_info = ctk.CTkLabel(f, text="", text_color=MUTED, anchor="w", justify="left",
+                                     font=("Segoe UI", 11), wraplength=300)
+        self.lbl_info.pack(fill="x", padx=4, pady=(8, 0))
+
+        self._section(f, "Film")
+        self.switch(f, "mirror", "Mirror horizontally", False)
+        self.switch(f, "trim", "Trim transparent borders", False)
+        ctk.CTkLabel(f, text="Trim on: cropped artwork is fitted to the selected size.",
+                     text_color=MUTED, font=("Segoe UI", 11), anchor="w").pack(fill="x", padx=4, pady=(2, 0))
+
+        self._section(f, "White underbase")
+        self.switch(f, "ub", "Also export white underbase PNG", False, live=False)
+        self.slider(f, "ubchoke", "Underbase choke", 0, 10, 2, "{:.0f} px", steps=10, live=False)
+
+        self._section(f, "Preview")
+        self.menu(f, "prevsz", ["1280", "1920", "2560"], "1920", "Preview detail")
+        self._update_custom_state()
+
+    # ------------------------------------------------------------ helpers
+    @staticmethod
+    def _hex(c):
+        return "#%02x%02x%02x" % tuple(c)
+
+    def params(self):
+        p = {k: v.get() for k, (v, d) in self.vars.items()}
+        return p
+
+    def _mode_changed(self, *_):
+        if self._resetting:
+            return
+        if self.vars["mode"][0].get() == "Halftone":
+            try:
+                self.tabs.set("Halftone")
+            except Exception:
+                pass
+
+    def _auto_ht(self, *_):
+        if self._resetting:
+            return
+        v = self.vars["mode"][0]
+        if v.get() != "Halftone":
+            v.set("Halftone")
+
+    def reset(self):
+        """Back to the state right after importing the image."""
+        self.apply_settings({}, run=False)
+        self.active_preset, self.preset_dirty = "Default", False
+        self._render_presets()
+        self.picking = False
+        self.viewer.configure(cursor="arrow")
+        self.bg_var.set("Checker")
+        self.view_var.set("Result")
+        try:
+            self.tabs.set("Remove")
+        except Exception:
+            pass
+        self._refit = True
+        self._update_info()
+        self.schedule()
+
+    def clear(self):
+        """Remove the image and get ready for the next one."""
+        if self._after:
+            self.after_cancel(self._after)
+            self._after = None
+        self.src = self.src_alpha = self.proxy = self.proxy_alpha = None
+        self.src_path = None
+        self.result = None
+        self.src_size = (1, 1)
+        self.viewer.clear()
+        self.zoom_lbl.configure(text="")
+        self.lbl_file.configure(text="No image loaded")
+        self.lbl_info.configure(text="")
+        self.reset()
+        self.status.configure(text="Open an image to begin  (Ctrl+O)")
+
+    # ------------------------------------------------------- print / batch
+    def calc_out_for(self, size, p):
+        w, h = size
+        m = max(w, h)
+        L = self.SIZES.get(p["size"], None)
+        if L == -1:
+            try:
+                L = int(float(p["custom"]))
+            except (ValueError, TypeError):
+                L = m
+        if not L:
+            L = m
+        L = int(min(max(L, 64), 16000))
+        r = L / m
+        return (max(1, round(w * r)), max(1, round(h * r))), L
+
+    def _open_child(self, attr, cls):
+        win = getattr(self, attr, None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                win.focus_force()
+                return
+        except Exception:
+            pass
+        setattr(self, attr, cls(self))
+
+    def open_print(self):
+        if self.src is None:
+            messagebox.showinfo("Print", "Open an image first.")
+            return
+        self._open_child("_print_win", PrintWindow)
+
+    def open_batch(self):
+        self._open_child("_batch_win", BatchWindow)
+
+    # ------------------------------------------------------------ presets
+    PRESET_FILE = os.path.join(os.path.expanduser("~"), ".dtf_halftone_studio", "presets.json")
+
+    def _load_presets(self):
+        try:
+            with open(self.PRESET_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh).get("presets", {})
+            return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        except Exception:
+            return {}
+
+    def _write_presets(self):
+        try:
+            os.makedirs(os.path.dirname(self.PRESET_FILE), exist_ok=True)
+            with open(self.PRESET_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"presets": self.presets}, fh, indent=2, ensure_ascii=False)
+        except OSError as e:
+            self.status.configure(text=f"Could not write presets file: {e}")
+
+    def _tab_presets(self, f):
+        self.lbl_active = ctk.CTkLabel(f, text="", text_color=TXT, anchor="w", font=("Segoe UI", 12, "bold"))
+        self.lbl_active.pack(fill="x", padx=4, pady=(8, 0))
+        self._section(f, "Saved presets")
+        self.preset_list = ctk.CTkFrame(f, fg_color="transparent")
+        self.preset_list.pack(fill="x", padx=2)
+
+        self._section(f, "Save current settings as")
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.pack(fill="x", padx=4, pady=(6, 0))
+        self.preset_name = ctk.StringVar()
+        ent = ctk.CTkEntry(row, textvariable=self.preset_name, placeholder_text="Preset name", height=32,
+                           fg_color=CARD, border_color="#2a2a31")
+        ent.pack(side="left", fill="x", expand=True)
+        ent.bind("<Return>", lambda e: self.save_preset())
+        ctk.CTkButton(row, text="Save", width=64, height=32, fg_color=ACC, hover_color=ACC_H,
+                      command=self.save_preset).pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(f, text="Same name = overwrite. Presets keep every setting (mode, removal, halftone, output).",
+                     text_color=MUTED, font=("Segoe UI", 11), anchor="w", justify="left",
+                     wraplength=330).pack(fill="x", padx=4, pady=(4, 0))
+
+        self._section(f, "Reset")
+        ctk.CTkButton(f, text="Reset to default settings", height=32, fg_color=CARD, hover_color="#26262c",
+                      text_color=TXT, command=self.reset).pack(fill="x", padx=4, pady=(6, 0))
+        ctk.CTkButton(f, text="Delete all saved presets", height=32, fg_color=CARD, hover_color="#3a2326",
+                      text_color="#e07a7a", command=self.delete_all_presets).pack(fill="x", padx=4, pady=(6, 0))
+        self._render_presets()
+
+    def _render_presets(self):
+        for w in self.preset_list.winfo_children():
+            w.destroy()
+        for n in ["Default"] + list(self.presets):
+            row = ctk.CTkFrame(self.preset_list, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            act = n == self.active_preset
+            ctk.CTkButton(row, text=n, anchor="w", height=32, fg_color=ACC if act else CARD,
+                          hover_color=ACC_H if act else "#26262c", text_color="#ffffff" if act else TXT,
+                          command=lambda n=n: self.apply_preset(n)).pack(side="left", fill="x", expand=True)
+            if n != "Default":
+                ctk.CTkButton(row, text="✕", width=32, height=32, fg_color=CARD, hover_color="#3a2326",
+                              text_color=MUTED, command=lambda n=n: self.delete_preset(n)).pack(side="left", padx=(6, 0))
+        self._update_active_label()
+
+    def _update_active_label(self):
+        if hasattr(self, "lbl_active"):
+            self.lbl_active.configure(
+                text=f"Active: {self.active_preset}" + ("  ·  modified" if self.preset_dirty else ""))
+
+    def _mark_dirty(self, *_):
+        if self._resetting or not hasattr(self, "lbl_active") or self.preset_dirty:
+            return
+        self.preset_dirty = True
+        self._update_active_label()
+
+    def apply_settings(self, data, run=True):
+        """Apply a dict of settings; anything missing falls back to the factory default."""
+        self._resetting = True
+        for k, (v, d) in self.vars.items():
+            if k == "prevsz":
+                continue
+            v.set(data.get(k, d))
+        self._resetting = False
+        kc = data.get("_key")
+        self.key_color = tuple(kc) if kc else (0, 255, 0)
+        self.swatch.configure(fg_color=self._hex(self.key_color))
+        self._update_custom_state()
+        if run:
+            self._update_info()
+            self.schedule()
+
+    def apply_preset(self, name):
+        data = {} if name == "Default" else self.presets.get(name)
+        if data is None:
+            return
+        self.apply_settings(data)
+        self.active_preset, self.preset_dirty = name, False
+        self._render_presets()
+        self.status.configure(text=f"Preset loaded: {name}")
+
+    def save_preset(self):
+        name = self.preset_name.get().strip()
+        if not name:
+            self.status.configure(text="Type a preset name first.")
+            return
+        if name.lower() == "default":
+            messagebox.showinfo("Preset", "\"Default\" is reserved. Please choose another name.")
+            return
+        if name in self.presets and not messagebox.askyesno("Overwrite", f"Preset \"{name}\" already exists. Overwrite?"):
+            return
+        data = {k: v.get() for k, (v, d) in self.vars.items() if k != "prevsz"}
+        data["_key"] = list(self.key_color)
+        self.presets[name] = data
+        self._write_presets()
+        self.active_preset, self.preset_dirty = name, False
+        self.preset_name.set("")
+        self._render_presets()
+        self.status.configure(text=f"Preset saved: {name}")
+
+    def delete_preset(self, name):
+        if not messagebox.askyesno("Delete preset", f"Delete preset \"{name}\"?"):
+            return
+        self.presets.pop(name, None)
+        self._write_presets()
+        if self.active_preset == name:
+            self.active_preset = "Default"
+        self._render_presets()
+
+    def delete_all_presets(self):
+        if not self.presets:
+            return
+        if not messagebox.askyesno("Delete all", "Delete ALL saved presets and return to default settings?"):
+            return
+        self.presets = {}
+        self._write_presets()
+        self.reset()
+
+    def _update_custom_state(self):
+        on = self.vars["size"][0].get() == "Custom"
+        self.custom_entry.configure(state="normal" if on else "disabled",
+                                    text_color=TXT if on else "#55555e")
+
+    def _maximize(self):
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            try:
+                self.attributes("-zoomed", True)
+            except tk.TclError:
+                self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+
+    def _toggle_fs(self, *_):
+        self._fs = not self._fs
+        self.attributes("-fullscreen", self._fs)
+
+    def _exit_fs(self, *_):
+        if self._fs:
+            self._fs = False
+            self.attributes("-fullscreen", False)
+
+    def calc_out(self, p):
+        w, h = self.src_size
+        m = max(w, h)
+        L = self.SIZES.get(p["size"], None)
+        if L == -1:
+            try:
+                L = int(float(p["custom"]))
+            except ValueError:
+                L = m
+        if not L:
+            L = m
+        L = int(min(max(L, 64), 16000))
+        r = L / m
+        return (max(1, round(w * r)), max(1, round(h * r))), L
+
+    def schedule(self, *_):
+        if self.src is None:
+            return
+        self._update_info()
+        if self._after:
+            self.after_cancel(self._after)
+        self._after = self.after(140, self.run_preview)
+
+    def _update_info(self):
+        if self.src is None:
+            self.lbl_info.configure(text="")
+            return
+        try:
+            p = self.params()
+            (W, H), _ = self.calc_out(p)
+            dpi = int(p["dpi"])
+            self.lbl_info.configure(
+                text=f"{W} × {H} px  ·  {W / dpi:.1f} × {H / dpi:.1f} in  ·  "
+                     f"{W / dpi * 2.54:.1f} × {H / dpi * 2.54:.1f} cm @ {dpi} DPI")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------- image IO
+    def open_image(self):
+        path = filedialog.askopenfilename(
+            title="Open image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            im = ImageOps.exif_transpose(Image.open(path))
+            alpha = None
+            if im.mode in ("RGBA", "LA") or "transparency" in im.info:
+                im = im.convert("RGBA")
+                alpha = im.getchannel("A")
+                if alpha.getextrema() == (255, 255):
+                    alpha = None
+            rgb = im.convert("RGB")
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot open image:\n{e}")
+            return
+
+        self.src, self.src_alpha = rgb, alpha
+        self.src_size = rgb.size
+        self.src_path = path
+        prox = rgb.copy()
+        prox.thumbnail((2560, 2560), Image.LANCZOS)
+        self.proxy = prox
+        if alpha is not None:
+            pa = alpha.copy()
+            pa.thumbnail((2560, 2560), Image.BILINEAR)
+            self.proxy_alpha = pa
+        else:
+            self.proxy_alpha = None
+        self.result = None
+        self.view_var.set("Result")
+        nm = os.path.basename(path)
+        nm = nm if len(nm) <= 36 else nm[:33] + "…"
+        self.lbl_file.configure(text=f"{nm}  ·  {rgb.size[0]} × {rgb.size[1]} px")
+        self.viewer.img = None
+        self._update_info()
+        self.run_preview()
+
+    # ------------------------------------------------------------- preview
+    def run_preview(self):
+        self._after = None
+        if self.src is None:
+            return
+        if self.busy:
+            self.dirty = True
+            return
+        self.busy, self.dirty = True, False
+        self.status.configure(text="Processing…")
+        threading.Thread(target=self._preview_worker, args=(self.params(), self.key_color), daemon=True).start()
+
+    def _preview_worker(self, p, key):
+        try:
+            (W, H), L = self.calc_out(p)
+            P = min(int(p["prevsz"]), L)
+            m = max(self.src_size)
+            size = (max(1, round(self.src_size[0] * P / m)), max(1, round(self.src_size[1] * P / m)))
+            img = render(self.proxy, self.proxy_alpha, size, P / L, p, key)
+            self.q.put(("preview", img))
+        except Exception as e:
+            self.q.put(("error", str(e)))
+        self.q.put(("done", None))
+
+    def _refresh_view(self, *_):
+        rf, self._refit = self._refit, False
+        if self.view_var.get() == "Original" and self.proxy is not None:
+            self.viewer.set_image(self.proxy, rf)
+        elif self.result is not None:
+            self.viewer.set_image(composite(self.result, self.bg_var.get()), rf)
+
+    # --------------------------------------------------------------- pick
+    def start_pick(self):
+        if self.proxy is None:
+            return
+        self.picking = True
+        self.view_var.set("Original")
+        self._refresh_view()
+        self.viewer.configure(cursor="crosshair")
+        self.status.configure(text="Click on the colour you want to remove…")
+
+    def _on_click(self, x, y):
+        if not self.picking or self.proxy is None:
+            return
+        x, y = min(x, self.proxy.size[0] - 1), min(y, self.proxy.size[1] - 1)
+        self.key_color = self.proxy.getpixel((x, y))
+        self.swatch.configure(fg_color=self._hex(self.key_color))
+        self.picking = False
+        self.viewer.configure(cursor="arrow")
+        self.view_var.set("Result")
+        self.vars["target"][0].set("Custom")
+        self.run_preview()
+
+    # --------------------------------------------------------------- export
+    def export(self):
+        if self.src is None or self.btn_export.cget("state") == "disabled":
+            return
+        base = os.path.splitext(os.path.basename(self.src_path))[0]
+        path = filedialog.asksaveasfilename(defaultextension=".png", initialfile=f"{base}_dtf.png",
+                                            filetypes=[("PNG", "*.png")])
+        if not path:
+            return
+        self.btn_export.configure(state="disabled", text="Exporting…")
+        self.progress.pack(fill="x", pady=(10, 0))
+        self.progress.start()
+        self.status.configure(text="Rendering full resolution…")
+        threading.Thread(target=self._export_worker, args=(path, self.params(), self.key_color), daemon=True).start()
+
+    def _export_worker(self, path, p, key):
+        try:
+            size, L = self.calc_out(p)
+            # long side is guaranteed to equal the selected size (even with trim on)
+            img = render(self.src, self.src_alpha, size, 1.0, p, key, fit_long=L)
+            dpi = int(p["dpi"])
+            img.save(path, "PNG", dpi=(dpi, dpi))
+            extra = ""
+            if p["ub"]:
+                up = os.path.splitext(path)[0] + "_underbase.png"
+                make_underbase(img, p["ubchoke"]).save(up, "PNG", dpi=(dpi, dpi))
+                extra = f"  +  {os.path.basename(up)}"
+            self.q.put(("exported", f"Saved {os.path.basename(path)}  ({img.size[0]} × {img.size[1]} px){extra}"))
+        except Exception as e:
+            self.q.put(("error", str(e)))
+        self.q.put(("export_end", None))
+
+    # ----------------------------------------------------------------- loop
+    def _poll(self):
+        try:
+            while True:
+                kind, data = self.q.get_nowait()
+                if kind == "preview":
+                    if self.src is None:
+                        continue
+                    self.result = data
+                    self._refresh_view()
+                    self.status.configure(text=f"Preview {data.size[0]} × {data.size[1]} px  ·  "
+                                               f"scroll = zoom, drag = pan, double-click = fit")
+                elif kind == "done":
+                    self.busy = False
+                    if self.dirty:
+                        self.run_preview()
+                elif kind == "exported":
+                    self.status.configure(text=data)
+                elif kind == "export_end":
+                    self.progress.stop()
+                    self.progress.pack_forget()
+                    self.btn_export.configure(state="normal", text="Export Transparent PNG")
+                elif kind == "error":
+                    if self.src is not None:
+                        self.status.configure(text=f"Error: {data}")
+        except queue.Empty:
+            pass
+        self.after(50, self._poll)
+
+
+class PrintWindow(ctk.CTkToplevel):
+    STAGE = (42, 42, 48)
+    PLACES = PLACEMENTS
+
+    def __init__(self, app):
+        super().__init__(app, fg_color=BG)
+        self.app = app
+        self.title("Print  ·  DTF Halftone Studio")
+        self.geometry(f"{app.winfo_screenwidth()}x{app.winfo_screenheight() - 70}+0+0")
+        self.minsize(1100, 720)
+        self.after(250, lambda: maximize_window(self))
+        self.unit, self.sizes = load_sizes()
+        self.sel = 0
+        self.q = queue.Queue()
+        self.busy = False
+        self._pv = None
+        self._tk = None
+        self.p = dict(app.params(), mirror=False)   # sublimation mirror is handled below
+        self.key = app.key_color
+        self.printers, self.default_printer = list_printers()
+        self._build()
+        self.select(0)
+        self.after(150, self._grab)
+        self.after(60, self._poll)
+
+    def _grab(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+        except Exception:
+            pass
+
+    # ---- small widget helpers
+    def _sec(self, parent, text):
+        ctk.CTkLabel(parent, text=text.upper(), font=("Segoe UI", 10, "bold"), text_color=MUTED,
+                     anchor="w").pack(fill="x", pady=(16, 2), padx=14)
+
+    def _seg(self, parent, var, values, cmd=None, padx=12):
+        s = ctk.CTkSegmentedButton(parent, values=values, variable=var, command=(lambda v: cmd()) if cmd else None,
+                                   selected_color=ACC, selected_hover_color=ACC_H, unselected_color=CARD,
+                                   unselected_hover_color="#26262c", fg_color=CARD, text_color=TXT, height=28)
+        s.pack(fill="x", padx=padx, pady=(6, 0))
+        return s
+
+    def _menu(self, parent, label, var, values, cmd=None):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(8, 0))
+        ctk.CTkLabel(row, text=label, text_color=TXT).pack(side="left")
+        ctk.CTkOptionMenu(row, values=values, variable=var, command=(lambda v: cmd()) if cmd else None,
+                          fg_color=CARD, button_color=CARD, button_hover_color="#26262c",
+                          dropdown_fg_color=CARD, text_color=TXT, width=190, height=28).pack(side="right")
+
+    def _field(self, parent, label, var, width=110):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=(6, 0))
+        ctk.CTkLabel(row, text=label, text_color=TXT).pack(side="left")
+        ctk.CTkEntry(row, textvariable=var, width=width, height=28, fg_color=BG,
+                     border_color="#2a2a31").pack(side="right")
+
+    # ---- layout
+    def _build(self):
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        left = ctk.CTkScrollableFrame(self, width=390, fg_color=PANEL, corner_radius=0)
+        left.grid(row=0, column=0, sticky="nsew")
+        right = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(left, text="Print", font=("Segoe UI", 18, "bold"), text_color=TXT,
+                     anchor="w").pack(fill="x", padx=14, pady=(14, 0))
+
+        # -- sizes
+        self._sec(left, "Print size")
+        self.unit_var = ctk.StringVar(value=self.unit)
+        self._seg(left, self.unit_var, ["in", "cm"], self._unit_changed)
+        self.size_list = ctk.CTkFrame(left, fg_color="transparent")
+        self.size_list.pack(fill="x", padx=10, pady=(6, 0))
+
+        form = ctk.CTkFrame(left, fg_color=CARD, corner_radius=8)
+        form.pack(fill="x", padx=12, pady=(10, 0))
+        self.f_name, self.f_w, self.f_h, self.f_top, self.f_side = (ctk.StringVar() for _ in range(5))
+        self.f_view = ctk.StringVar(value="Front")
+        self.f_place = ctk.StringVar(value="Center")
+        self._field(form, "Name", self.f_name, 170)
+        self._field(form, "Width", self.f_w)
+        self._field(form, "Height", self.f_h)
+        self._field(form, "Offset from collar / sleeve hem", self.f_top)
+        self._field(form, "Side offset from centre (chest)", self.f_side)
+        self._seg(form, self.f_view, ["Front", "Back"], self.schedule, padx=10)
+        self._menu(form, "Placement", self.f_place, self.PLACES, self.schedule)
+        brow = ctk.CTkFrame(form, fg_color="transparent")
+        brow.pack(fill="x", padx=10, pady=10)
+        brow.grid_columnconfigure((0, 1, 2), weight=1)
+        for i, (t, c) in enumerate((("Save size", self.save_size), ("Delete", self.delete_size),
+                                    ("Reset list", self.reset_sizes))):
+            ctk.CTkButton(brow, text=t, height=28, fg_color=ACC if i == 0 else BG,
+                          hover_color=ACC_H if i == 0 else "#26262c", text_color=TXT,
+                          command=c).grid(row=0, column=i, sticky="ew", padx=2)
+        for v in (self.f_w, self.f_h, self.f_top, self.f_side, self.f_name):
+            v.trace_add("write", self.schedule)
+
+        # -- shirt
+        self._sec(left, "T-shirt preview")
+        self.kind = ctk.StringVar(value="White")
+        self._seg(left, self.kind, ["White", "Black", "Outline"], self.schedule)
+        self.shirt_size = ctk.StringVar(value="M")
+        self._menu(left, "Shirt size", self.shirt_size, list(SHIRT_BODY_IN), self.schedule)
+        row = ctk.CTkFrame(left, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(10, 0))
+        ctk.CTkLabel(row, text="Collar line", text_color=TXT).pack(side="left")
+        self.collar = ctk.DoubleVar(value=12.5)
+        self.collar_lbl = ctk.CTkLabel(row, text="12.5%", text_color=MUTED)
+        self.collar_lbl.pack(side="right")
+        ctk.CTkSlider(left, from_=5, to=25, variable=self.collar, height=14, progress_color=ACC,
+                      button_color=ACC, button_hover_color=ACC_H, fg_color="#2a2a31").pack(fill="x", padx=14)
+        self.collar.trace_add("write", lambda *a: (self.collar_lbl.configure(text=f"{self.collar.get():.1f}%"),
+                                                   self.schedule()))
+        ctk.CTkLabel(left, text="Want your own shirt photos? Put white.png, black.png, outline.png "
+                                "(and optional *_back.png) in a 'shirts' folder next to this script. "
+                                "Transparent PNGs work best.", text_color=MUTED, font=("Segoe UI", 11),
+                     anchor="w", justify="left", wraplength=350).pack(fill="x", padx=14, pady=(6, 0))
+
+        # -- paper & printer
+        self._sec(left, "Paper & printer")
+        self.printer = ctk.StringVar(
+            value=self.default_printer if self.default_printer in self.printers else "System default")
+        self._menu(left, "Printer", self.printer, ["System default"] + self.printers)
+        self.paper = ctk.StringVar(value=PA3)
+        self._menu(left, "Paper", self.paper, list(PAPERS), self.schedule)
+        self.dpi = ctk.StringVar(value="300")
+        self._menu(left, "Print DPI", self.dpi, ["150", "300", "600"], self.schedule)
+        self.copies = ctk.StringVar(value="1")
+        self._field(left, "Copies", self.copies, 70)
+        self.mirror = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(left, text="Mirror for sublimation transfer", variable=self.mirror, progress_color=ACC,
+                      text_color=TXT, button_color="#d0d0d8").pack(anchor="w", padx=14, pady=(12, 0))
+        ctk.CTkLabel(left, text="Set the same paper size in your printer settings. The design is printed at its "
+                                "true physical size (no scaling). Tip: fix the paper to the shirt with "
+                                "heat-resistant tape so it cannot shift (ghosting).", text_color=MUTED, font=("Segoe UI", 11),
+                     anchor="w", justify="left", wraplength=350).pack(fill="x", padx=14, pady=(6, 0))
+        if sys.platform.startswith("win"):
+            ctk.CTkButton(left, text="Printer settings…", height=28, fg_color=CARD, hover_color="#26262c",
+                          text_color=TXT, command=self.printer_settings).pack(fill="x", padx=14, pady=(10, 14))
+
+        # -- right
+        self.canvas = tk.Canvas(right, bg=BG, highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 6))
+        self.canvas.bind("<Configure>", lambda e: self.schedule())
+        self.info = ctk.CTkLabel(right, text="", text_color=MUTED, anchor="w", justify="left", wraplength=820)
+        self.info.grid(row=1, column=0, sticky="ew", padx=18)
+        self.pbox = ctk.CTkFrame(right, fg_color="transparent", height=6)
+        self.pbox.grid(row=2, column=0, sticky="ew", padx=18, pady=(6, 0))
+        self.progress = ctk.CTkProgressBar(self.pbox, height=4, progress_color=ACC, fg_color=CARD,
+                                           mode="indeterminate")
+        bar = ctk.CTkFrame(right, fg_color="transparent")
+        bar.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 14))
+        self.btn_print = ctk.CTkButton(bar, text="Print", width=150, height=40, fg_color=ACC, hover_color=ACC_H,
+                                       font=("Segoe UI", 14, "bold"), command=self.print_now)
+        self.btn_print.pack(side="left")
+        self.btn_save = ctk.CTkButton(bar, text="Save print file…", width=150, height=40, fg_color=CARD,
+                                      hover_color="#26262c", text_color=TXT, command=self.save_file)
+        self.btn_save.pack(side="left", padx=8)
+        ctk.CTkButton(bar, text="Close", width=90, height=40, fg_color=CARD, hover_color="#26262c",
+                      text_color=MUTED, command=self.destroy).pack(side="right")
+        self.status = ctk.CTkLabel(bar, text="", text_color=MUTED, anchor="w")
+        self.status.pack(side="left", padx=10, fill="x", expand=True)
+
+    # ---- units / sizes
+    def _u(self, inches):
+        return inches if self.unit == "in" else inches * 2.54
+
+    def _inch(self, v):
+        return v if self.unit == "in" else v / 2.54
+
+    def _fill_form(self, s):
+        self.f_name.set(s["name"])
+        self.f_w.set(fmt_num(self._u(s["w"])))
+        self.f_h.set(fmt_num(self._u(s["h"])))
+        self.f_top.set(fmt_num(self._u(s.get("top", 3.0))))
+        self.f_side.set(fmt_num(self._u(s.get("side", 3.0))))
+        self.f_view.set(s.get("view", "Front"))
+        self.f_place.set(s.get("place", "Center"))
+        if s.get("paper") in PAPERS:
+            self.paper.set(s["paper"])
+
+    def spec(self):
+        try:
+            w = self._inch(float(self.f_w.get().replace(",", ".")))
+            h = self._inch(float(self.f_h.get().replace(",", ".")))
+            top = self._inch(float(self.f_top.get().replace(",", ".")))
+            side = self._inch(float(self.f_side.get().replace(",", ".")))
+        except ValueError:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return dict(name=self.f_name.get().strip() or "Custom", w=w, h=h, view=self.f_view.get(),
+                    place=self.f_place.get(), top=top, side=side)
+
+    def _render_sizes(self):
+        for w in self.size_list.winfo_children():
+            w.destroy()
+        for i, s in enumerate(self.sizes):
+            act = i == self.sel
+            txt = f"{s['name']}    {fmt_num(self._u(s['w']))} × {fmt_num(self._u(s['h']))} {self.unit}"
+            ctk.CTkButton(self.size_list, text=txt, anchor="w", height=30, fg_color=ACC if act else CARD,
+                          hover_color=ACC_H if act else "#26262c", text_color="#ffffff" if act else TXT,
+                          command=lambda i=i: self.select(i)).pack(fill="x", pady=2)
+
+    def select(self, i):
+        if not (0 <= i < len(self.sizes)):
+            return
+        self.sel = i
+        self._fill_form(self.sizes[i])
+        self._render_sizes()
+        self.schedule()
+
+    def _unit_changed(self):
+        sp = self.spec()
+        self.unit = self.unit_var.get()
+        save_sizes(self.unit, self.sizes)
+        if sp:
+            self._fill_form(sp)
+        self._render_sizes()
+        self.schedule()
+
+    def save_size(self):
+        sp = self.spec()
+        if sp is None or not self.f_name.get().strip():
+            self.status.configure(text="Enter a name and valid numbers first.", text_color="#e0b050")
+            return
+        sp["paper"] = self.paper.get()
+        for i, s in enumerate(self.sizes):
+            if s["name"].lower() == sp["name"].lower():
+                self.sizes[i] = sp
+                self.sel = i
+                break
+        else:
+            self.sizes.append(sp)
+            self.sel = len(self.sizes) - 1
+        save_sizes(self.unit, self.sizes)
+        self._render_sizes()
+        self.status.configure(text=f"Size saved: {sp['name']}", text_color=MUTED)
+
+    def delete_size(self):
+        if not (0 <= self.sel < len(self.sizes)):
+            return
+        name = self.sizes[self.sel]["name"]
+        if not messagebox.askyesno("Delete size", f"Delete size '{name}'?", parent=self):
+            return
+        self.sizes.pop(self.sel)
+        save_sizes(self.unit, self.sizes)
+        self.sel = min(self.sel, len(self.sizes) - 1)
+        self._render_sizes()
+        if self.sizes:
+            self.select(self.sel)
+
+    def reset_sizes(self):
+        if not messagebox.askyesno("Reset sizes", "Restore the original size list?", parent=self):
+            return
+        self.sizes = default_sizes()
+        save_sizes(self.unit, self.sizes)
+        self.select(0)
+
+    # ---- preview
+    def schedule(self, *_):
+        if self._pv:
+            self.after_cancel(self._pv)
+        self._pv = self.after(120, self.draw_preview)
+
+    def draw_preview(self):
+        self._pv = None
+        c = self.canvas
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if cw < 80 or ch < 80:
+            return
+        c.delete("all")
+        sp = self.spec()
+        if sp is None:
+            c.create_text(cw / 2, ch / 2, text="Enter valid numbers for the size fields", fill=MUTED)
+            self.info.configure(text="")
+            return
+        try:
+            dpi = int(self.dpi.get())
+        except ValueError:
+            dpi = 300
+        body = SHIRT_BODY_IN.get(self.shirt_size.get(), 20)
+        W_in = body / 0.72
+        back = sp["view"] == "Back"
+        place = sp["place"]
+        sleeve = place in ("Left sleeve", "Right sleeve")
+        shirt = get_shirt(self.kind.get().lower(), back)
+        H_in = W_in * shirt.height / shirt.width
+        s = min(cw * 0.9 / W_in, ch * 0.9 / H_in)           # preview pixels per inch
+        sw, sh = max(1, round(W_in * s)), max(1, round(H_in * s))
+        sx, sy = (cw - sw) // 2, (ch - sh) // 2
+        stage = Image.new("RGB", (cw, ch), self.STAGE)
+        shimg = shirt.resize((sw, sh), Image.LANCZOS)
+        stage.paste(shimg.convert("RGB"), (sx, sy), shimg.getchannel("A"))
+
+        box = (max(4, round(sp["w"] * s)), max(4, round(sp["h"] * s)))
+        design = render_for_box(self.app.proxy, self.app.proxy_alpha, box, self.p, self.key,
+                                mirror=False, k=s / dpi)
+        collar_y = sy + (self.collar.get() / 100.0) * (0.34 if back else 1.0) * sh
+        mid = sx + sw / 2
+        corners = None
+        if sleeve:
+            left = place == "Left sleeve"                   # wearer's left = viewer's right
+            hem = (sx + (92.5 if left else 7.5) / 100.0 * sw, sy + 30.5 / 104.0 * sh)
+            phi = math.radians(-28.3 if left else 28.3)     # clockwise tilt of the sleeve axis
+            n = (math.sin(phi), -math.cos(phi))
+            dist = sp["top"] * s + design.height / 2
+            cxs, cys = hem[0] + n[0] * dist, hem[1] + n[1] * dist
+            rot = design.rotate(-math.degrees(phi), expand=True, resample=Image.BICUBIC)
+            stage.paste(rot.convert("RGB"), (round(cxs - rot.width / 2), round(cys - rot.height / 2)),
+                        rot.getchannel("A"))
+            hw, hh = sp["w"] * s / 2, sp["h"] * s / 2
+            corners = [(cxs + x * math.cos(phi) - y * math.sin(phi), cys + x * math.sin(phi) + y * math.cos(phi))
+                       for x, y in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))]
+        else:
+            if back or place == "Center":
+                xoff = 0.0
+            elif place == "Left chest":                      # wearer's left = viewer's right (front view)
+                xoff = sp["side"] + sp["w"] / 2
+            else:
+                xoff = -(sp["side"] + sp["w"] / 2)
+            cx = mid + xoff * s
+            top = collar_y + sp["top"] * s
+            stage.paste(design.convert("RGB"), (round(cx - design.width / 2), round(top)), design.getchannel("A"))
+
+        self._tk = ImageTk.PhotoImage(stage)
+        c.create_image(0, 0, anchor="nw", image=self._tk)
+        c.create_line(mid, sy, mid, sy + sh, fill="#6b6b78", dash=(2, 4))
+        lw, lh = f"{fmt_num(self._u(sp['w']))} {self.unit}", f"{fmt_num(self._u(sp['h']))} {self.unit}"
+        fnt = ("Segoe UI", 10, "bold")
+        if sleeve:
+            pts = [v for pt in corners for v in pt]
+            c.create_polygon(pts, outline=ACC_H, fill="", dash=(5, 4))
+            c.create_text(cxs, max(corners[2][1], corners[3][1]) + 12, text=f"{lw} × {lh}", fill=ACC_H, font=fnt)
+        else:
+            bx0, bx1 = cx - sp["w"] * s / 2, cx + sp["w"] * s / 2
+            by0, by1 = top, top + sp["h"] * s
+            c.create_rectangle(bx0, by0, bx1, by1, outline=ACC_H, dash=(5, 4))
+            c.create_text((bx0 + bx1) / 2, by1 + 12, fill=ACC_H, font=fnt, text=lw)
+            c.create_text(min(cw - 40, bx1 + 8), (by0 + by1) / 2, anchor="w", fill=ACC_H, font=fnt, text=lh)
+            # collar -> design ruler (like the placement guide)
+            c.create_line(mid, collar_y, mid, top, fill=ACC_H, width=2)
+            c.create_line(mid - 6, collar_y, mid + 6, collar_y, fill=ACC_H, width=2)
+            c.create_line(mid - 6, top, mid + 6, top, fill=ACC_H, width=2)
+            c.create_text(mid + 9, (collar_y + top) / 2, anchor="w", fill=ACC_H, font=fnt,
+                          text=f"{fmt_num(self._u(sp['top']))} {self.unit}")
+
+        dw_in, dh_in = design.width / s, design.height / s
+        warn = []
+        if not sleeve:
+            if dw_in > body * 0.98:
+                warn.append("wider than the shirt body")
+            if top + design.height > sy + sh * 0.98:
+                warn.append("extends past the hem")
+        paper = PAPERS.get(self.paper.get())
+        if paper is not None:
+            pname = self.paper.get().split(" (")[0]
+            if paper[0] == "roll":
+                if dw_in > paper[1] - 0.5:
+                    warn.append(f"is wider than {pname}")
+            else:
+                pw, ph = paper
+                fits = (dw_in <= pw - 0.2 and dh_in <= ph - 0.45) or (dw_in <= ph - 0.2 and dh_in <= pw - 0.45)
+                if not fits:
+                    warn.append(f"does not fit on {pname}")
+        line = (f"{sp['name']}  ·  design {fmt_num(self._u(dw_in))} × {fmt_num(self._u(dh_in))} {self.unit}"
+                f" inside {lw} × {lh}  ·  {round(dw_in * dpi)} × {round(dh_in * dpi)} px @ {dpi} DPI")
+        self.info.configure(text=line + ("\nWarning: design " + "; ".join(warn) if warn else "\nFits the shirt and the paper"),
+                            text_color="#e0b050" if warn else MUTED)
+
+    # ---- printing
+    def printer_settings(self):
+        name = self.printer.get()
+        if name == "System default":
+            name = self.default_printer
+        if name:
+            try:
+                subprocess.Popen(["rundll32", "printui.dll,PrintUIEntry", "/e", "/n", name])
+            except Exception as e:
+                self.status.configure(text=str(e), text_color="#e07a7a")
+
+    def _opts(self):
+        sp = self.spec()
+        if sp is None:
+            self.status.configure(text="Check the size fields.", text_color="#e0b050")
+            return None
+        try:
+            dpi = int(self.dpi.get())
+            copies = max(1, int(self.copies.get()))
+        except ValueError:
+            self.status.configure(text="Copies must be a number.", text_color="#e0b050")
+            return None
+        return sp, dpi, copies, PAPERS.get(self.paper.get()), self.printer.get(), self.mirror.get()
+
+    def print_now(self):
+        o = self._opts()
+        if o is None or self.busy:
+            return
+        sp, dpi, copies, paper, printer, mirror = o
+        msg = (f"Print '{sp['name']}'  ({fmt_num(self._u(sp['w']))} × {fmt_num(self._u(sp['h']))} {self.unit})\n"
+               f"Paper: {self.paper.get()}   ·   {dpi} DPI   ·   Copies: {copies}\n"
+               f"Printer: {printer}\nMirrored: {'yes' if mirror else 'no'}")
+        if messagebox.askyesno("Print", msg, parent=self):
+            self._start(o, None)
+
+    def save_file(self):
+        o = self._opts()
+        if o is None or self.busy:
+            return
+        base = os.path.splitext(os.path.basename(self.app.src_path or "design"))[0]
+        nm = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in o[0]["name"])
+        path = filedialog.asksaveasfilename(parent=self, defaultextension=".pdf", initialfile=f"{base}_{nm}.pdf",
+                                            filetypes=[("PDF (exact physical size)", "*.pdf"), ("PNG", "*.png")])
+        if path:
+            self._start(o, path)
+
+    def _start(self, o, save_path):
+        self.busy = True
+        self.btn_print.configure(state="disabled")
+        self.btn_save.configure(state="disabled")
+        self.progress.pack(fill="x")
+        self.progress.start()
+        self.status.configure(text="Rendering at print resolution…", text_color=MUTED)
+        threading.Thread(target=self._worker, args=(o, save_path), daemon=True).start()
+
+    def _worker(self, o, save_path):
+        sp, dpi, copies, paper, printer, mirror = o
+        try:
+            sheet, _ = build_sheet(self.app.src, self.app.src_alpha, self.p, self.key, sp["w"], sp["h"],
+                                   paper, dpi, mirror)
+            if save_path:
+                save_sheet(sheet, save_path, dpi)
+                msg = f"Saved {os.path.basename(save_path)}  ({sheet.size[0]} × {sheet.size[1]} px @ {dpi} DPI)"
+            else:
+                self.q.put(("msg", "Sending to printer…"))
+                msg = send_to_printer(sheet, dpi, printer, copies)
+            self.q.put(("ok", msg))
+        except Exception as e:
+            self.q.put(("err", str(e)))
+        self.q.put(("end", None))
+
+    def _poll(self):
+        try:
+            while True:
+                kind, data = self.q.get_nowait()
+                if kind == "msg":
+                    self.status.configure(text=data, text_color=MUTED)
+                elif kind == "ok":
+                    self.status.configure(text=data, text_color="#7bd88f")
+                elif kind == "err":
+                    self.status.configure(text=f"Error: {data}", text_color="#e07a7a")
+                elif kind == "end":
+                    self.busy = False
+                    self.progress.stop()
+                    self.progress.pack_forget()
+                    self.btn_print.configure(state="normal")
+                    self.btn_save.configure(state="normal")
+        except queue.Empty:
+            pass
+        except Exception:
+            return
+        try:
+            self.after(60, self._poll)
+        except Exception:
+            pass
+
+
+class BatchWindow(ctk.CTkToplevel):
+    EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+
+    def __init__(self, app):
+        super().__init__(app, fg_color=BG)
+        self.app = app
+        self.title("Batch  ·  DTF Halftone Studio")
+        self.geometry(f"{app.winfo_screenwidth()}x{app.winfo_screenheight() - 70}+0+0")
+        self.minsize(960, 680)
+        self.after(250, lambda: maximize_window(self))
+        self.items = []          # (path, relative_dir)
+        self.q = queue.Queue()
+        self.stop = threading.Event()
+        self.running = False
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after(60, self._poll)
+        self.after(150, self._grab)
+
+    def _grab(self):
+        try:
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _sec(self, parent, text):
+        ctk.CTkLabel(parent, text=text.upper(), font=("Segoe UI", 10, "bold"), text_color=MUTED,
+                     anchor="w").pack(fill="x", pady=(14, 2), padx=14)
+
+    def _build(self):
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # ------- left: file list
+        left = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        left.grid(row=0, column=0, sticky="nsew", padx=(16, 0), pady=(16, 8))
+        left.grid_rowconfigure(2, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(left, text="Batch background remove", font=("Segoe UI", 18, "bold"), text_color=TXT,
+                     anchor="w").grid(row=0, column=0, sticky="w")
+        bar = ctk.CTkFrame(left, fg_color="transparent")
+        bar.grid(row=1, column=0, sticky="ew", pady=10)
+        for t, c in (("Add images…", self.add_files), ("Add folder…", self.add_folder)):
+            ctk.CTkButton(bar, text=t, height=32, width=120, fg_color=ACC, hover_color=ACC_H,
+                          command=c).pack(side="left", padx=(0, 8))
+        self.sub = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(bar, text="Include subfolders", variable=self.sub, progress_color=ACC, text_color=TXT,
+                      button_color="#d0d0d8").pack(side="left", padx=8)
+
+        lf = ctk.CTkFrame(left, fg_color=CARD, corner_radius=8)
+        lf.grid(row=2, column=0, sticky="nsew")
+        lf.grid_rowconfigure(0, weight=1)
+        lf.grid_columnconfigure(0, weight=1)
+        self.listbox = tk.Listbox(lf, selectmode="extended", bg=CARD, fg=TXT, bd=0, highlightthickness=0,
+                                  selectbackground=ACC, activestyle="none", font=("Segoe UI", 10))
+        self.listbox.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
+        sb = tk.Scrollbar(lf, command=self.listbox.yview)
+        sb.grid(row=0, column=1, sticky="ns", pady=10, padx=(0, 6))
+        self.listbox.configure(yscrollcommand=sb.set)
+
+        row = ctk.CTkFrame(left, fg_color="transparent")
+        row.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ctk.CTkButton(row, text="Remove selected", height=28, width=120, fg_color=CARD, hover_color="#26262c",
+                      text_color=TXT, command=self.remove_selected).pack(side="left")
+        ctk.CTkButton(row, text="Clear list", height=28, width=90, fg_color=CARD, hover_color="#26262c",
+                      text_color=TXT, command=self.clear_list).pack(side="left", padx=8)
+        self.count = ctk.CTkLabel(row, text="0 images", text_color=MUTED)
+        self.count.pack(side="right")
+
+        # ------- right: settings
+        right = ctk.CTkScrollableFrame(self, width=370, fg_color=PANEL, corner_radius=0)
+        right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(16, 0))
+
+        self._sec(right, "Settings to use")
+        self.settings_var = ctk.StringVar(value="Current settings")
+        ctk.CTkOptionMenu(right, values=["Current settings", "Default"] + list(self.app.presets),
+                          variable=self.settings_var, command=lambda v: self._summary(), fg_color=CARD,
+                          button_color=CARD, button_hover_color="#26262c", dropdown_fg_color=CARD,
+                          text_color=TXT, height=30).pack(fill="x", padx=14, pady=(6, 0))
+        self.summary = ctk.CTkLabel(right, text="", text_color=MUTED, anchor="w", justify="left",
+                                    font=("Segoe UI", 11), wraplength=350)
+        self.summary.pack(fill="x", padx=14, pady=(6, 0))
+
+        self._sec(right, "Output folder")
+        orow = ctk.CTkFrame(right, fg_color="transparent")
+        orow.pack(fill="x", padx=14, pady=(6, 0))
+        self.out_var = ctk.StringVar()
+        ctk.CTkEntry(orow, textvariable=self.out_var, placeholder_text="Choose where PNGs are saved", height=30,
+                     fg_color=CARD, border_color="#2a2a31").pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(orow, text="Browse", width=70, height=30, fg_color=CARD, hover_color="#26262c",
+                      text_color=TXT, command=self.browse_out).pack(side="left", padx=(6, 0))
+
+        srow = ctk.CTkFrame(right, fg_color="transparent")
+        srow.pack(fill="x", padx=14, pady=(10, 0))
+        ctk.CTkLabel(srow, text="File name suffix", text_color=TXT).pack(side="left")
+        self.suffix = ctk.StringVar(value="_dtf")
+        ctk.CTkEntry(srow, textvariable=self.suffix, width=110, height=28, fg_color=CARD,
+                     border_color="#2a2a31").pack(side="right")
+        prow = ctk.CTkFrame(right, fg_color="transparent")
+        prow.pack(fill="x", padx=14, pady=(10, 0))
+        ctk.CTkLabel(prow, text="If file exists", text_color=TXT).pack(side="left")
+        self.policy = ctk.StringVar(value="Auto-number")
+        ctk.CTkOptionMenu(prow, values=["Auto-number", "Overwrite", "Skip"], variable=self.policy, fg_color=CARD,
+                          button_color=CARD, button_hover_color="#26262c", dropdown_fg_color=CARD,
+                          text_color=TXT, width=140, height=28).pack(side="right")
+        self.keep = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(right, text="Keep subfolder structure", variable=self.keep, progress_color=ACC,
+                      text_color=TXT, button_color="#d0d0d8").pack(anchor="w", padx=14, pady=(12, 0))
+
+        self.btn_run = ctk.CTkButton(right, text="Run batch", height=42, fg_color=ACC, hover_color=ACC_H,
+                                     font=("Segoe UI", 14, "bold"), command=self.run)
+        self.btn_run.pack(fill="x", padx=14, pady=(22, 0))
+        self.btn_stop = ctk.CTkButton(right, text="Stop", height=30, fg_color=CARD, hover_color="#3a2326",
+                                      text_color="#e07a7a", state="disabled", command=self.stop.set)
+        self.btn_stop.pack(fill="x", padx=14, pady=(8, 0))
+        self.progress = ctk.CTkProgressBar(right, height=6, progress_color=ACC, fg_color=CARD)
+        self.progress.set(0)
+        self.progress.pack(fill="x", padx=14, pady=(14, 0))
+        self.status = ctk.CTkLabel(right, text="Add images or a folder to begin.", text_color=MUTED, anchor="w",
+                                   justify="left", wraplength=350)
+        self.status.pack(fill="x", padx=14, pady=(6, 0))
+        ctk.CTkButton(right, text="Open output folder", height=28, fg_color=CARD, hover_color="#26262c",
+                      text_color=TXT, command=self.open_out).pack(fill="x", padx=14, pady=(10, 0))
+
+        # ------- log
+        self.log = ctk.CTkTextbox(self, height=170, fg_color=CARD, text_color=MUTED, font=("Consolas", 11))
+        self.log.grid(row=1, column=0, sticky="nsew", padx=(16, 0), pady=(0, 16))
+        self.log.configure(state="disabled")
+        self._summary()
+
+    # ---- file list
+    def _refresh_list(self):
+        self.listbox.delete(0, "end")
+        for path, rel in self.items:
+            self.listbox.insert("end", os.path.basename(path) + (f"      [{rel}]" if rel else ""))
+        self.count.configure(text=f"{len(self.items)} image{'s' if len(self.items) != 1 else ''}")
+
+    def _add(self, entries):
+        have = {p for p, _ in self.items}
+        for path, rel in entries:
+            if path not in have and path.lower().endswith(self.EXTS):
+                self.items.append((path, rel))
+                have.add(path)
+        self._refresh_list()
+
+    def add_files(self):
+        files = filedialog.askopenfilenames(parent=self, title="Select images", filetypes=[
+            ("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")])
+        self._add([(f, "") for f in files])
+
+    def add_folder(self):
+        base = filedialog.askdirectory(parent=self, title="Select a folder of images")
+        if not base:
+            return
+        found = []
+        if self.sub.get():
+            for root, _, files in os.walk(base):
+                rel = os.path.relpath(root, base)
+                rel = "" if rel == "." else rel
+                found += [(os.path.join(root, f), rel) for f in sorted(files)]
+        else:
+            found = [(os.path.join(base, f), "") for f in sorted(os.listdir(base))
+                     if os.path.isfile(os.path.join(base, f))]
+        before = len(self.items)
+        self._add(found)
+        if not self.out_var.get():
+            self.out_var.set(os.path.join(base, "_dtf_output"))
+        self.status.configure(text=f"Added {len(self.items) - before} images from the folder.")
+
+    def remove_selected(self):
+        for i in reversed(self.listbox.curselection()):
+            self.items.pop(i)
+        self._refresh_list()
+
+    def clear_list(self):
+        self.items = []
+        self._refresh_list()
+
+    def browse_out(self):
+        d = filedialog.askdirectory(parent=self, title="Output folder")
+        if d:
+            self.out_var.set(d)
+
+    def open_out(self):
+        d = self.out_var.get().strip()
+        if not d or not os.path.isdir(d):
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(d)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", d])
+            else:
+                subprocess.Popen(["xdg-open", d])
+        except Exception:
+            pass
+
+    # ---- settings
+    def settings(self):
+        choice = self.settings_var.get()
+        if choice == "Current settings":
+            return self.app.params(), self.app.key_color
+        data = {} if choice == "Default" else self.app.presets.get(choice, {})
+        p = {k: d for k, (v, d) in self.app.vars.items()}
+        p.update({k: v for k, v in data.items() if k != "_key"})
+        kc = data.get("_key")
+        return p, (tuple(kc) if kc else (0, 255, 0))
+
+    def _summary(self):
+        p, _ = self.settings()
+        mode = p["mode"] + (f" ({p['shape']})" if p["mode"] == "Halftone" else "")
+        size = p["size"] + (f" {p['custom']} px" if p["size"] == "Custom" else "")
+        extra = []
+        if p.get("mirror"):
+            extra.append("mirrored")
+        if p.get("ub"):
+            extra.append("+ white underbase")
+        self.summary.configure(text=f"{mode}  ·  remove: {p['target']}\nSize: {size}  ·  {p['dpi']} DPI"
+                                    + ("  ·  " + ", ".join(extra) if extra else ""))
+
+    # ---- run
+    def run(self):
+        if self.running:
+            return
+        if not self.items:
+            self.status.configure(text="Add images or a folder first.")
+            return
+        out = self.out_var.get().strip()
+        if not out:
+            self.status.configure(text="Choose an output folder.")
+            return
+        try:
+            os.makedirs(out, exist_ok=True)
+        except OSError as e:
+            self.status.configure(text=f"Cannot create output folder: {e}")
+            return
+        p, key = self.settings()
+        suffix = self.suffix.get().replace("/", "_").replace("\\", "_")
+        self.stop.clear()
+        self.running = True
+        self.btn_run.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.progress.set(0)
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        threading.Thread(target=self._worker, daemon=True,
+                         args=(list(self.items), p, key, out, suffix, self.policy.get(), self.keep.get())).start()
+
+    @staticmethod
+    def _dest(path, policy):
+        if not os.path.exists(path):
+            return path
+        if policy == "Overwrite":
+            return path
+        if policy == "Skip":
+            return None
+        stem, ext = os.path.splitext(path)
+        n = 1
+        while os.path.exists(f"{stem}_{n}{ext}"):
+            n += 1
+        return f"{stem}_{n}{ext}"
+
+    def _worker(self, items, p, key, out, suffix, policy, keep):
+        ok = skip = fail = 0
+        total = len(items)
+        try:
+            dpi = int(p["dpi"])
+        except (ValueError, TypeError):
+            dpi = 300
+        for i, (path, rel) in enumerate(items, 1):
+            if self.stop.is_set():
+                break
+            name = os.path.basename(path)
+            self.q.put(("status", f"{i}/{total}  ·  {name}"))
+            try:
+                rgb, alpha = load_source(path)
+                size, L = self.app.calc_out_for(rgb.size, p)
+                folder = os.path.join(out, rel) if (keep and rel) else out
+                os.makedirs(folder, exist_ok=True)
+                dest = self._dest(os.path.join(folder, os.path.splitext(name)[0] + suffix + ".png"), policy)
+                if dest is None:
+                    skip += 1
+                    self.q.put(("log", f"SKIP   {name}  (already exists)"))
+                else:
+                    img = render(rgb, alpha, size, 1.0, p, key, fit_long=L)
+                    img.save(dest, "PNG", dpi=(dpi, dpi))
+                    if p.get("ub"):
+                        ub = os.path.splitext(dest)[0] + "_underbase.png"
+                        make_underbase(img, p["ubchoke"]).save(ub, "PNG", dpi=(dpi, dpi))
+                    ok += 1
+                    self.q.put(("log", f"OK     {name}  →  {os.path.basename(dest)}  ({img.size[0]} × {img.size[1]})"))
+                    del img
+                del rgb, alpha
+            except Exception as e:
+                fail += 1
+                self.q.put(("log", f"FAIL   {name}  ({e})"))
+            gc.collect()
+            self.q.put(("progress", i / total))
+        self.q.put(("done", (ok, skip, fail, self.stop.is_set())))
+
+    def _poll(self):
+        try:
+            while True:
+                kind, data = self.q.get_nowait()
+                if kind == "status":
+                    self.status.configure(text=data)
+                elif kind == "progress":
+                    self.progress.set(data)
+                elif kind == "log":
+                    self.log.configure(state="normal")
+                    self.log.insert("end", data + "\n")
+                    self.log.see("end")
+                    self.log.configure(state="disabled")
+                elif kind == "done":
+                    ok, skip, fail, stopped = data
+                    self.running = False
+                    self.btn_run.configure(state="normal")
+                    self.btn_stop.configure(state="disabled")
+                    self.status.configure(text=("Stopped.  " if stopped else "Finished.  ")
+                                               + f"{ok} saved, {skip} skipped, {fail} failed.")
+        except queue.Empty:
+            pass
+        except Exception:
+            return
+        try:
+            self.after(60, self._poll)
+        except Exception:
+            pass
+
+    def _close(self):
+        if self.running:
+            if not messagebox.askyesno("Batch running", "Stop the batch and close this window?", parent=self):
+                return
+            self.stop.set()
+        self.destroy()
+
+
+LOGO_B64 = (
+    "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"
+    "QmCC"
+)
+
+
+if __name__ == "__main__":
+    App().mainloop()
